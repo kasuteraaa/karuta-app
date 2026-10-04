@@ -412,7 +412,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, getDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, getDoc, onSnapshot, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Global Firebase Configuration Setup
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'karuta-tournament-app';
@@ -631,141 +631,187 @@
         const excelFileInput = document.getElementById('excelFileInput');
         const importStatus = document.getElementById('importStatus');
 
-        excelFileInput.addEventListener('change', async function(e) {
+excelFileInput.addEventListener('change', async function(e) {
             if (!auth.currentUser || auth.currentUser.email !== ADMIN_EMAIL) {
                 alert("データ取り込み権限がありません。管理者としてログインしてください。");
                 excelFileInput.value = '';
                 return;
             }
 
-            const files = e.target.files;
-            if (!files || files.length === 0) return;
+            const files = Array.from(e.target.files || []);
+            if (files.length === 0) return;
 
-            importStatus.textContent = "解析してクラウドに保存しています...";
-            importStatus.classList.remove('hidden', 'text-red-600');
-            importStatus.classList.add('text-amber-800');
+            const setStatus = (text, kind) => {
+                importStatus.textContent = text;
+                importStatus.classList.remove('hidden', 'text-amber-800', 'text-red-600', 'text-emerald-700');
+                importStatus.classList.add(kind === 'error' ? 'text-red-600' : kind === 'ok' ? 'text-emerald-700' : 'text-amber-800');
+            };
 
-            let filesProcessed = 0;
-            let newRecordsAdded = 0;
+            setStatus("解析してクラウドに保存しています...", 'progress');
 
-            Array.from(files).forEach(file => {
+            // 全角→半角
+            const toHalf = (str) => String(str ?? "")
+                .replace(/[Ａ-Ｚａ-ｚ０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+                .trim();
+            const cellStr = (v) => (v === undefined || v === null) ? "" : String(v).trim();
+
+            const readFile = (file) => new Promise((resolve, reject) => {
                 const reader = new FileReader();
-                reader.onload = async function(event) {
-                    try {
-                        const data = new Uint8Array(event.target.result);
-                        const workbook = XLSX.read(data, { type: 'array' });
-                        
-                        let sheetNamesToProcess = workbook.SheetNames.filter(name => 
-                            name.includes("対戦結果") || name.match(/[A-EＡ-Ｅ]級/)
-                        );
-                        if (sheetNamesToProcess.length === 0) {
-                            sheetNamesToProcess = workbook.SheetNames;
-                        }
-
-                        let guessedTournamentName = file.name.replace(/\.[^/.]+$/, "");
-
-                        for (const sheetName of sheetNamesToProcess) {
-                            const worksheet = workbook.Sheets[sheetName];
-                            const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
-                            
-                            let sheetClass = "不明";
-                            const classMatch = sheetName.match(/([A-EＡ-Ｅ])級/);
-                            if (classMatch) {
-                                const rawClass = classMatch[1].replace(/[Ａ-Ｅ]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xfee0));
-                                sheetClass = rawClass + "級";
-                            }
-                            
-                            if (rows && rows.length > 0) {
-                                for (let i = 0; i < rows.length; i++) {
-                                    const values = rows[i];
-                                    if (!values || values.length < 2) continue;
-                                    
-                                    const valB = String(values[1] || "").trim();
-                                    if (!valB || ["選手名", "氏名", "名前", "選手", "No.", "No"].includes(valB)) continue;
-
-                                    const newRecord = {
-                                        playerName: valB,
-                                        society: String(values[2] || "").trim(),
-                                        playerClass: sheetClass,
-                                        tournamentName: guessedTournamentName,
-                                        date: new Date().toLocaleDateString('ja-JP', { year: 'numeric', month: 'short' }),
-                                        result: "",
-                                        matches: []
-                                    };
-                                    
-                                    let roundNum = 1;
-                                    let lastWinLoss = "";
-                                    let winCount = 0;
-
-                                    for (let col = 3; col < values.length; col += 3) {
-                                        if (roundNum > 6) break;
-
-                                        let opponent = values[col] !== undefined ? String(values[col]).trim() : "";
-                                        let margin = values[col + 1] !== undefined ? String(values[col + 1]).trim() : "";
-                                        let winLossRaw = values[col + 2] !== undefined ? String(values[col + 2]).trim() : "";
-
-                                        if (!opponent && !margin && !winLossRaw) {
-                                            roundNum++;
-                                            continue;
-                                        }
-
-                                        let winLoss = "";
-                                        if (winLossRaw.includes("〇") || winLossRaw.includes("○") || winLossRaw.includes("勝") || winLossRaw.includes("1") || winLossRaw.includes("□")) {
-                                            winLoss = "win";
-                                            winCount++;
-                                            lastWinLoss = "win";
-                                        } else if (winLossRaw.includes("×") || winLossRaw.includes("負") || winLossRaw.includes("0")) {
-                                            winLoss = "loss";
-                                            lastWinLoss = "loss";
-                                        }
-
-                                        newRecord.matches.push({
-                                            round: `${roundNum}回戦`,
-                                            opponent: opponent || "対戦相手不明",
-                                            opponentSociety: "",
-                                            winLoss: winLoss,
-                                            margin: margin || "0"
-                                        });
-
-                                        roundNum++;
-                                    }
-
-                                    if (newRecord.matches.length > 0) {
-                                        if (lastWinLoss === "win") {
-                                            newRecord.result = `${winCount}勝 (${newRecord.matches.length}試合)`;
-                                        } else {
-                                            newRecord.result = `${newRecord.matches.length}回戦敗退`;
-                                        }
-
-                                        if (isCloudConnected && auth.currentUser) {
-                                            await addDoc(recordsColRef, newRecord);
-                                        } else {
-                                            appDatabase.push({ id: Date.now() + Math.random(), ...newRecord });
-                                        }
-                                        newRecordsAdded++;
-                                    }
-                                }
-                            }
-                        }
-
-                        filesProcessed++;
-                        if (filesProcessed === files.length) {
-                            importStatus.textContent = `${files.length}個のファイルから ${newRecordsAdded} 件を取り込みました！`;
-                            importStatus.classList.remove('text-amber-800', 'text-red-600');
-                            importStatus.classList.add('text-emerald-700');
-                            excelFileInput.value = '';
-                            performSearch(true);
-                        }
-                    } catch (error) {
-                        console.error("Excel parse error:", error);
-                        importStatus.textContent = "読み込みに失敗しました。ファイル構造を確認してください。";
-                        importStatus.classList.remove('text-amber-800', 'text-emerald-700');
-                        importStatus.classList.add('text-red-600');
-                    }
-                };
-
+                reader.onload = () => resolve(new Uint8Array(reader.result));
+                reader.onerror = () => reject(reader.error || new Error("ファイルを読み取れませんでした"));
                 reader.readAsArrayBuffer(file);
             });
+
+            // 1ファイル分を解析して、保存用レコード配列を返す（保存はしない）
+            function parseWorkbook(workbook, tournamentName) {
+                const records = [];
+
+                // 「対戦結果表＿A級」のようなシートだけを対象にする
+                let targets = workbook.SheetNames.filter(name => /([A-EＡ-Ｅ])\s*級/.test(name) && name.includes("対戦結果"));
+                if (targets.length === 0) {
+                    targets = workbook.SheetNames.filter(name => /([A-EＡ-Ｅ])\s*級/.test(name));
+                }
+                if (targets.length === 0) {
+                    throw new Error("「対戦結果表＿〇級」という名前のシートが見つかりません（シート名: " + workbook.SheetNames.join(", ") + "）");
+                }
+
+                const dateLabel = new Date().toLocaleDateString('ja-JP', { year: 'numeric', month: 'short' });
+
+                for (const sheetName of targets) {
+                    const worksheet = workbook.Sheets[sheetName];
+                    if (!worksheet) continue;
+
+                    const classLetter = toHalf(sheetName.match(/([A-EＡ-Ｅ])\s*級/)[1]).toUpperCase();
+                    const sheetClass = classLetter + "級";
+                    const maxRounds = (classLetter === "A" || classLetter === "B") ? 6 : 5;
+
+                    const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "", raw: true });
+
+                    for (const values of rows) {
+                        if (!values || values.length < 2) continue;
+
+                        // A列: No.（数字の行だけを選手行とみなす）
+                        const noStr = toHalf(cellStr(values[0]));
+                        if (!/^\d+$/.test(noStr)) continue;
+
+                        // B列: 選手名 / C列: 所属
+                        const playerName = cellStr(values[1]);
+                        if (!playerName) continue;
+                        const society = cellStr(values[2]);
+
+                        const record = {
+                            playerName,
+                            society,
+                            playerClass: sheetClass,
+                            tournamentName,
+                            date: dateLabel,
+                            result: "",
+                            matches: []
+                        };
+
+                        let winCount = 0;
+                        let lastWinLoss = "";
+
+                        // D,E,F = 1回戦（相手・枚数差・勝敗）、G,H,I = 2回戦 ...
+                        for (let r = 1; r <= maxRounds; r++) {
+                            const col = 3 + (r - 1) * 3;
+                            const opponent = cellStr(values[col]);
+                            const margin = cellStr(values[col + 1]);
+                            const winLossRaw = cellStr(values[col + 2]);
+
+                            if (!opponent && !margin && !winLossRaw) continue;
+
+                            let winLoss = "";
+                            if (/[〇○◯◎勝]/.test(winLossRaw) || /^(1|win|w)$/i.test(winLossRaw)) {
+                                winLoss = "win";
+                                winCount++;
+                                lastWinLoss = "win";
+                            } else if (/[×✕✖負]/.test(winLossRaw) || /^(0|lose|loss|l)$/i.test(winLossRaw)) {
+                                winLoss = "loss";
+                                lastWinLoss = "loss";
+                            } else if (/[△不]/.test(winLossRaw)) {
+                                winLoss = "";
+                            }
+
+                            record.matches.push({
+                                round: `${r}回戦`,
+                                opponent: opponent || "対戦相手不明",
+                                opponentSociety: "",
+                                winLoss,
+                                margin: margin || "0"
+                            });
+                        }
+
+                        if (record.matches.length === 0) continue;
+
+                        if (lastWinLoss === "win") {
+                            record.result = `${winCount}勝 (${record.matches.length}試合)`;
+                        } else {
+                            record.result = `${record.matches.length}回戦敗退`;
+                        }
+
+                        // 同じファイルを再度取り込んでも重複しないよう、固定のIDを付ける
+                        record._docId = `${tournamentName}_${sheetClass}_${noStr}`.replace(/[\/\\\s.#\[\]?]+/g, "_");
+                        records.push(record);
+                    }
+                }
+                return records;
+            }
+
+            let totalAdded = 0;
+            const failures = [];
+
+            for (const file of files) {
+                try {
+                    const data = await readFile(file);
+                    const workbook = XLSX.read(data, { type: 'array' });
+                    const tournamentName = file.name.replace(/\.[^/.]+$/, "");
+                    const records = parseWorkbook(workbook, tournamentName);
+
+                    if (records.length === 0) {
+                        throw new Error("選手データ（A列がNo.の行）が見つかりませんでした");
+                    }
+
+                    if (isCloudConnected && auth.currentUser) {
+                        // Firestoreのバッチ書き込み（1回あたり最大500件のため400件ずつ）
+                        for (let i = 0; i < records.length; i += 400) {
+                            const batch = writeBatch(db);
+                            records.slice(i, i + 400).forEach(rec => {
+                                const { _docId, ...payload } = rec;
+                                batch.set(doc(recordsColRef, _docId), payload);
+                            });
+                            await batch.commit();
+                        }
+                    } else {
+                        records.forEach(rec => {
+                            const { _docId, ...payload } = rec;
+                            const idx = appDatabase.findIndex(r => r.id === _docId);
+                            const item = { id: _docId, ...payload };
+                            if (idx >= 0) appDatabase[idx] = item; else appDatabase.push(item);
+                        });
+                    }
+                    totalAdded += records.length;
+                } catch (error) {
+                    console.error("Import error:", file.name, error);
+                    let reason = error && error.message ? error.message : String(error);
+                    if (error && error.code === 'permission-denied') {
+                        reason = "Firestoreへの書き込み権限がありません（Firestoreのセキュリティルールを確認してください）";
+                    } else if (error && error.code) {
+                        reason = `${error.code}: ${reason}`;
+                    }
+                    failures.push(`${file.name}：${reason}`);
+                }
+            }
+
+            excelFileInput.value = '';
+
+            if (failures.length === 0) {
+                setStatus(`${files.length}個のファイルから ${totalAdded} 件を取り込みました！`, 'ok');
+            } else {
+                const head = totalAdded > 0 ? `${totalAdded} 件を取り込みましたが、` : "";
+                setStatus(`${head}読み込みに失敗したファイルがあります → ${failures.join(" / ")}`, 'error');
+            }
+            if (totalAdded > 0) performSearch(true);
         });
 
         // Search & Filter Operations
