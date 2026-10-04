@@ -698,24 +698,57 @@ excelFileInput.addEventListener('change', async function(e) {
             function parseWorkbook(workbook, tournamentName) {
                 const records = [];
 
-                // 「対戦結果表＿A級」のようなシートだけを対象にする
-                let targets = workbook.SheetNames.filter(name => /([A-EＡ-Ｅ])\s*級/.test(name) && name.includes("対戦結果"));
-                if (targets.length === 0) {
-                    targets = workbook.SheetNames.filter(name => /([A-EＡ-Ｅ])\s*級/.test(name));
-                }
-                if (targets.length === 0) {
-                    throw new Error("「対戦結果表＿〇級」という名前のシートが見つかりません（シート名: " + workbook.SheetNames.join(", ") + "）");
+                // 級の判定：「A級」「Ａ級」「E1級」「D3級」「対戦結果表＿C級」「対戦結果_B」など、
+                // 表記が違っていてもA〜Eのアルファベットを見つけて級とみなす（数字は無視）
+                const detectClass = (text) => {
+                    const t = toHalf(text).toUpperCase();
+                    let m = t.match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\s*\d*\s*級/); // E1級 / D3級 / A級
+                    if (!m) m = t.match(/級\s*([A-E])(?![A-Z])/);                      // 級A
+                    if (!m) m = t.match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\s*\d*\s*(?:$|[^A-Z])/); // E1 / D3 / 結果_C
+                    return m ? m[1] : null;
+                };
+
+                // シート上部（先頭数行）に「E級」などの記載があればそこからも判定
+                const detectClassFromSheet = (worksheet) => {
+                    const top = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "", raw: true }).slice(0, 6);
+                    for (const row of top) {
+                        for (const cell of row) {
+                            const txt = cellStr(cell);
+                            if (!txt) continue;
+                            const m = toHalf(txt).toUpperCase().match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\d*\s*級/);
+                            if (m) return m[1];
+                        }
+                    }
+                    return null;
+                };
+
+                // 対象シートの決定
+                let entries = workbook.SheetNames
+                    .map(name => ({ name, letter: detectClass(name) }))
+                    .filter(e => e.letter);
+
+                // 「結果」を含むシートがあればそれを優先（組合せ表・参加者名簿などを避ける）
+                const resultEntries = entries.filter(e => e.name.includes("結果") || e.name.includes("対戦"));
+                if (resultEntries.length > 0) entries = resultEntries;
+
+                // シート名から級が分からない場合は、全シートを対象に中身から判定
+                if (entries.length === 0) {
+                    entries = workbook.SheetNames.map(name => ({
+                        name,
+                        letter: workbook.Sheets[name] ? detectClassFromSheet(workbook.Sheets[name]) : null
+                    }));
                 }
 
                 const dateLabel = new Date().toLocaleDateString('ja-JP', { year: 'numeric', month: 'short' });
 
-                for (const sheetName of targets) {
+                for (const entry of entries) {
+                    const sheetName = entry.name;
                     const worksheet = workbook.Sheets[sheetName];
                     if (!worksheet) continue;
 
-                    const classLetter = toHalf(sheetName.match(/([A-EＡ-Ｅ])\s*級/)[1]).toUpperCase();
-                    const sheetClass = classLetter + "級";
-                    const maxRounds = (classLetter === "A" || classLetter === "B") ? 6 : 5;
+                    const classLetter = entry.letter;
+                    const sheetClass = classLetter ? classLetter + "級" : "不明";
+                    const maxRounds = (!classLetter || classLetter === "A" || classLetter === "B") ? 6 : 5;
 
                     const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "", raw: true });
 
@@ -783,7 +816,8 @@ excelFileInput.addEventListener('change', async function(e) {
                         }
 
                         // 同じファイルを再度取り込んでも重複しないよう、固定のIDを付ける
-                        record._docId = `${tournamentName}_${sheetClass}_${noStr}`.replace(/[\/\\\s.#\[\]?]+/g, "_");
+                        record.sheetName = sheetName;
+                        record._docId = `${tournamentName}_${sheetName}_${noStr}`.replace(/[\/\\\s.#\[\]?]+/g, "_");
                         records.push(record);
                     }
                 }
@@ -801,7 +835,7 @@ excelFileInput.addEventListener('change', async function(e) {
                     const records = parseWorkbook(workbook, tournamentName);
 
                     if (records.length === 0) {
-                        throw new Error("選手データ（A列がNo.の行）が見つかりませんでした");
+                        throw new Error("選手データ（A列がNo.の行）が見つかりませんでした。シート名: " + workbook.SheetNames.join(", "));
                     }
 
                     if (isCloudConnected && auth.currentUser) {
