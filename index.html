@@ -685,7 +685,11 @@ excelFileInput.addEventListener('change', async function(e) {
             const toHalf = (str) => String(str ?? "")
                 .replace(/[Ａ-Ｚａ-ｚ０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
                 .trim();
-            const cellStr = (v) => (v === undefined || v === null) ? "" : String(v).trim();
+            const cellStr = (v) => {
+                if (v === undefined || v === null || v instanceof Date) return "";
+                const t = String(v).replace(/[\u3000\u00a0]/g, " ").replace(/\s+/g, " ").trim();
+                return /^#(N\/A|REF!|VALUE!|DIV\/0!|NAME\?|NUM!|NULL!)/i.test(t) ? "" : t;
+            };
 
             const readFile = (file) => new Promise((resolve, reject) => {
                 const reader = new FileReader();
@@ -741,11 +745,23 @@ excelFileInput.addEventListener('change', async function(e) {
             const isNoHeader = (t) => /^(no\.?|№|番号)$/i.test(t);
             const isNameHeader = (t) => /^(選手名|氏名|名前|選手|プレイヤー名?|参加者名?)([(（].*[)）])?$/.test(t);
             const isSocHeader = (t) => /^(所属.{0,6}|会名|団体名?|かるた会名?|支部名?|クラブ名?|チーム名?)$/.test(t);
+            const isRankHeader = (t) => /^(順位|最終順位|成績)$/.test(t);
+            const isClassHeader = (t) => /^(級|級別)$/.test(t);
+            const isClass2Header = (t) => /^クラス$/.test(t);
             const isStrictRoleHeader = (t) => /^(対戦相手|相手|相手選手|相手名|対戦者|枚数差?|枚差|枚|勝敗|勝ち負け|勝負|結果|[〇○]×|相手所属)$/.test(t);
             const isHeaderCell = (text) => {
                 const t = normHead(text);
                 if (!t || t.length > 14) return false;
-                return isNoHeader(t) || isNameHeader(t) || isSocHeader(t) || isStrictRoleHeader(t) || roundOf(text) !== null;
+                return isNoHeader(t) || isNameHeader(t) || isSocHeader(t) || isRankHeader(t) || isClassHeader(t) || isClass2Header(t) || isStrictRoleHeader(t) || roundOf(text) !== null;
+            };
+
+            // 級の判定：「A級」「Ａ級」「E1級」「D3級」「C級」「C1」など、A〜Eのアルファベットを探す（数字は無視）
+            const detectClass = (text) => {
+                const t = toHalf(text).toUpperCase();
+                let m = t.match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\s*\d*\s*級/);
+                if (!m) m = t.match(/級\s*([A-E])(?![A-Z])/);
+                if (!m) m = t.match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\s*\d*\s*(?:$|[^A-Z])/);
+                return m ? m[1] : null;
             };
 
             function analyzeLayout(worksheet, rows) {
@@ -771,10 +787,13 @@ excelFileInput.addEventListener('change', async function(e) {
                 let headerEnd = -1;
                 grid.forEach((row, r) => { if (row.some(isHeaderCell)) headerEnd = r; });
 
-                const layout = { found: headerEnd >= 0, headerEnd, noCol: null, nameCol: null, socCol: null, rounds: [], notes };
+                const layout = {
+                    found: headerEnd >= 0, headerEnd,
+                    noCol: null, nameCol: null, socCol: null, rankCol: null, classCol: null, classCol2: null,
+                    nameFromHeader: false, rounds: [], notes
+                };
 
                 if (!layout.found) {
-                    // 見出しが読めない場合は標準配置（A=No. B=選手名 C=所属 D以降3列ずつ）
                     layout.noCol = 0; layout.nameCol = 1; layout.socCol = 2;
                     layout.headerEnd = -1;
                     notes.push("見出し行を判定できなかったため標準の列配置で読み込みました");
@@ -831,13 +850,16 @@ excelFileInput.addEventListener('change', async function(e) {
                     }
                 });
 
-                // 3) No. / 選手名 / 所属 の列（回戦に属さない列から探す）
+                // 3) No. / 選手名 / 所属 / 順位 / 級 の列（回戦に属さない列から探す）
                 for (let c = 0; c < width; c++) {
                     if (colInfo[c]) continue;
                     for (const t of headerCells(c).map(normHead)) {
                         if (layout.noCol === null && isNoHeader(t)) layout.noCol = c;
-                        else if (layout.nameCol === null && isNameHeader(t)) layout.nameCol = c;
+                        else if (layout.nameCol === null && isNameHeader(t)) { layout.nameCol = c; layout.nameFromHeader = true; }
                         else if (layout.socCol === null && isSocHeader(t)) layout.socCol = c;
+                        else if (layout.rankCol === null && isRankHeader(t)) layout.rankCol = c;
+                        else if (layout.classCol === null && isClassHeader(t)) layout.classCol = c;
+                        else if (layout.classCol2 === null && isClass2Header(t)) layout.classCol2 = c;
                     }
                 }
 
@@ -851,83 +873,145 @@ excelFileInput.addEventListener('change', async function(e) {
                 return { layout, useFixed: false };
             }
 
-// 1ファイル分を解析して、保存用レコード配列を返す（保存はしない）
-            function parseWorkbook(workbook, tournamentName, fileNotes) {
-                const records = [];
-
-                // 級の判定：「A級」「Ａ級」「E1級」「D3級」「対戦結果表＿C級」「対戦結果_B」など、
-                // 表記が違っていてもA〜Eのアルファベットを見つけて級とみなす（数字は無視）
-                const detectClass = (text) => {
-                    const t = toHalf(text).toUpperCase();
-                    let m = t.match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\s*\d*\s*級/); // E1級 / D3級 / A級
-                    if (!m) m = t.match(/級\s*([A-E])(?![A-Z])/);                      // 級A
-                    if (!m) m = t.match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\s*\d*\s*(?:$|[^A-Z])/); // E1 / D3 / 結果_C
-                    return m ? m[1] : null;
-                };
-
-                // シート上部（先頭数行）に「E級」などの記載があればそこからも判定
-                const detectClassFromSheet = (worksheet) => {
-                    const top = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "", raw: true }).slice(0, 6);
-                    for (const row of top) {
+            // ===== 大会名・開催年月をブック内から探す =====
+            // ファイル名から大会名らしく整える（「結果」「最終」「6回戦」「AB級」などを除く）
+            const cleanFileName = (base) => {
+                const t = base.replace(/[_＿]+/g, " ")
+                    .replace(/[A-EＡ-Ｅ]{1,5}\s*級/g, "")
+                    .replace(/[0-9０-９]+\s*回戦/g, "")
+                    .replace(/(大会)?(結果|報告)/g, "$1")
+                    .replace(/最終|確定|修正|仮|V[0-9]+(?:[ _][0-9]+)*/gi, "")
+                    .replace(/[()（）]/g, " ")
+                    .replace(/\s+/g, " ").trim();
+                return t || base;
+            };
+            function topCells(worksheet, maxRow = 20, maxCol = 12) {
+                try {
+                    return XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "", raw: true, range: `A1:${XLSX.utils.encode_col(maxCol - 1)}${maxRow}` });
+                } catch (e) { return []; }
+            }
+            function detectTournamentTitle(workbook) {
+                for (const name of workbook.SheetNames) {
+                    const ws = workbook.Sheets[name];
+                    if (!ws) continue;
+                    for (const row of topCells(ws, 12)) {
                         for (const cell of row) {
-                            const txt = cellStr(cell);
-                            if (!txt) continue;
-                            const m = toHalf(txt).toUpperCase().match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\d*\s*級/);
-                            if (m) return m[1];
+                            if (typeof cell !== "string") continue;
+                            const m = toHalf(cellStr(cell)).match(/第\s*\d+\s*回[^\s（）()【】\[\]]*?大会/);
+                            if (m) return m[0].replace(/\s+/g, "");
                         }
                     }
-                    return null;
-                };
+                }
+                return null;
+            }
+            function detectDateLabel(workbook, baseName) {
+                const sheets = workbook.SheetNames.map(n => workbook.Sheets[n]).filter(Boolean);
+                // ① 「2026年9月」のような文字
+                for (const ws of sheets) {
+                    for (const row of topCells(ws, 20)) {
+                        for (const cell of row) {
+                            if (typeof cell !== "string") continue;
+                            const m = toHalf(cell).match(/(20\d{2})\s*年\s*(\d{1,2})\s*月/);
+                            if (m) return `${m[1]}年${parseInt(m[2], 10)}月`;
+                        }
+                    }
+                }
+                // ② 日付セル
+                for (const ws of sheets) {
+                    for (const row of topCells(ws, 10)) {
+                        for (const cell of row) {
+                            if (cell instanceof Date && !isNaN(cell)) {
+                                const d = new Date(cell.getTime() + 12 * 3600 * 1000);
+                                if (d.getFullYear() >= 2000) return `${d.getFullYear()}年${d.getMonth() + 1}月`;
+                            }
+                        }
+                    }
+                }
+                // ②' 日付の形式になっていない数字（Excelのシリアル値。例: 46245 = 2026年8月）
+                for (const ws of sheets) {
+                    for (const row of topCells(ws, 8, 8)) {
+                        for (const cell of row) {
+                            if (typeof cell === "number" && Number.isInteger(cell) && cell >= 43831 && cell <= 47848) {
+                                const d = new Date(Date.UTC(1899, 11, 30) + cell * 86400000);
+                                return `${d.getUTCFullYear()}年${d.getUTCMonth() + 1}月`;
+                            }
+                        }
+                    }
+                }
+                // ③ ファイル名の年
+                const y = toHalf(baseName).match(/(20\d{2})/);
+                return y ? `${y[1]}年` : null;
+            }
 
-                // 対象シートの決定
-                let entries = workbook.SheetNames
-                    .map(name => ({ name, letter: detectClass(name) }))
-                    .filter(e => e.letter);
+            // 1ファイル分を解析して、保存用レコード配列を返す（保存はしない）
+            function parseWorkbook(workbook, fileName, fileNotes) {
+                const records = [];
+                const baseName = fileName.replace(/\.[^/.]+$/, "");
+                const tournamentName = detectTournamentTitle(workbook) || cleanFileName(baseName);
+                const dateLabel = detectDateLabel(workbook, baseName) || new Date().toLocaleDateString('ja-JP', { year: 'numeric', month: 'short' });
 
-                // 「結果」を含むシートがあればそれを優先（組合せ表・参加者名簿などを避ける）
-                const resultEntries = entries.filter(e => e.name.includes("結果") || e.name.includes("対戦"));
-                if (resultEntries.length > 0) entries = resultEntries;
+                // 全シートを見出しの中身で解析する（シート名には頼らない）
+                const analyzed = [];
+                for (const sheetName of workbook.SheetNames) {
+                    const worksheet = workbook.Sheets[sheetName];
+                    if (!worksheet || !worksheet['!ref']) continue;
 
-                // シート名から級が分からない場合は、全シートを対象に中身から判定
-                if (entries.length === 0) {
-                    entries = workbook.SheetNames.map(name => ({
-                        name,
-                        letter: workbook.Sheets[name] ? detectClassFromSheet(workbook.Sheets[name]) : null
-                    }));
+                    // 範囲がA1から始まらないシートでも列番号がずれないよう、A1始まりにそろえる
+                    const rng = XLSX.utils.decode_range(worksheet['!ref']);
+                    rng.s.r = 0; rng.s.c = 0;
+                    worksheet['!ref'] = XLSX.utils.encode_range(rng);
+
+                    const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "", raw: true });
+                    // 末尾の空行を捨てる
+                    while (rows.length > 0 && (rows[rows.length - 1] || []).every(v => cellStr(v) === "")) rows.pop();
+
+                    const a = analyzeLayout(worksheet, rows);
+                    analyzed.push({ sheetName, worksheet, rows, layout: a.layout, useFixed: a.useFixed });
                 }
 
-                const dateLabel = new Date().toLocaleDateString('ja-JP', { year: 'numeric', month: 'short' });
+                // 見出しから「選手名」と「回戦の列」が見つかったシートが、対戦結果のシート
+                let targets = analyzed.filter(s => s.layout.found && !s.useFixed && s.layout.nameFromHeader);
 
-                for (const entry of entries) {
-                    const sheetName = entry.name;
-                    const worksheet = workbook.Sheets[sheetName];
-                    if (!worksheet) continue;
+                // 見つからない場合の保険：シート名に級が入っているシートを標準配置で読む
+                if (targets.length === 0) {
+                    targets = analyzed.filter(s => detectClass(s.sheetName));
+                    targets.forEach(s => {
+                        const letter = detectClass(s.sheetName);
+                        const maxRounds = (letter === "A" || letter === "B") ? 6 : 5;
+                        s.layout.rounds = Array.from({ length: maxRounds }, (_, i) => {
+                            const col = 3 + i * 3;
+                            return { round: i + 1, opponent: col, margin: col + 1, result: col + 2, oppSociety: undefined };
+                        });
+                        s.layout.noCol = 0; s.layout.nameCol = 1; s.layout.socCol = 2; s.layout.headerEnd = -1;
+                    });
+                }
+                if (targets.length === 0) {
+                    throw new Error("対戦結果のシートが見つかりません（シート名: " + workbook.SheetNames.join(", ") + "）");
+                }
 
-                    const classLetter = entry.letter;
-                    const sheetClass = classLetter ? classLetter + "級" : "不明";
-                    const maxRounds = (!classLetter || classLetter === "A" || classLetter === "B") ? 6 : 5;
-
-                    // 範囲がA1から始まらないシートでも列番号がずれないよう、読み取り範囲をA1始まりにそろえる
-                    if (worksheet['!ref']) {
-                        const rng = XLSX.utils.decode_range(worksheet['!ref']);
-                        rng.s.r = 0; rng.s.c = 0;
-                        worksheet['!ref'] = XLSX.utils.encode_range(rng);
-                    }
-                    const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "", raw: true });
-
-                    // 見出し行から列の役割を判定
-                    const analyzed = analyzeLayout(worksheet, rows);
-                    const layout = analyzed.layout;
-                    if (analyzed.useFixed) {
-                        const fixedRounds = [];
-                        for (let r = 1; r <= maxRounds; r++) {
-                            const col = 3 + (r - 1) * 3;
-                            fixedRounds.push({ round: r, opponent: col, margin: col + 1, result: col + 2, oppSociety: undefined });
-                        }
-                        layout.rounds = fixedRounds;
-                    }
+                for (const sheet of targets) {
+                    const { sheetName, worksheet, rows, layout } = sheet;
                     layout.notes.forEach(n => fileNotes.push(`${sheetName}: ${n}`));
                     console.info("列の判定結果", sheetName, layout);
+
+                    // シート全体の級（シート名 → 左上のセル → 上部のタイトル）。行ごとの「級」列があればそちらを優先
+                    let sheetLetter = detectClass(sheetName);
+                    if (!sheetLetter) {
+                        const corner = toHalf(cellStr((rows[0] || [])[0])).toUpperCase();
+                        if (/^[A-E]$/.test(corner)) sheetLetter = corner;
+                    }
+                    if (!sheetLetter) {
+                        for (const row of rows.slice(0, HEADER_ROWS)) {
+                            for (const cell of row) {
+                                const t = cellStr(cell);
+                                if (t && t.length <= 40) {
+                                    const m = toHalf(t).toUpperCase().match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\d*\s*級/);
+                                    if (m) { sheetLetter = m[1]; break; }
+                                }
+                            }
+                            if (sheetLetter) break;
+                        }
+                    }
 
                     for (let rowIdx = layout.headerEnd + 1; rowIdx < rows.length; rowIdx++) {
                         const values = rows[rowIdx];
@@ -938,10 +1022,17 @@ excelFileInput.addEventListener('change', async function(e) {
                         const noStr = layout.noCol !== null ? toHalf(get(layout.noCol)) : "";
                         if (layout.noCol !== null && !/^\d+$/.test(noStr)) continue;
 
-                        // 選手名・所属
+                        // 選手名・所属・順位
                         const playerName = get(layout.nameCol);
                         if (!playerName || isNameHeader(normHead(playerName))) continue;
                         const society = get(layout.socCol);
+                        const rank = get(layout.rankCol);
+
+                        // 級：行ごとの「級」「クラス」列 → シート全体の級
+                        const rowLetter = (layout.classCol !== null && detectClass(get(layout.classCol)))
+                            || (layout.classCol2 !== null && detectClass(get(layout.classCol2)))
+                            || sheetLetter;
+                        const sheetClass = rowLetter ? rowLetter + "級" : "不明";
 
                         const record = {
                             playerName,
@@ -952,19 +1043,29 @@ excelFileInput.addEventListener('change', async function(e) {
                             result: "",
                             matches: []
                         };
+                        if (rank) record.rank = rank;
 
                         let winCount = 0;
+                        let lossCount = 0;
                         let lastWinLoss = "";
 
                         // 見出しから判定した列で、各回戦の相手・枚数差・勝敗を読む
                         for (const rc of layout.rounds) {
                             const r = rc.round;
-                            const opponent = get(rc.opponent);
-                            const margin = get(rc.margin);
+                            let opponent = get(rc.opponent);
+                            let margin = get(rc.margin);
                             const winLossRaw = get(rc.result);
                             const opponentSociety = get(rc.oppSociety);
 
                             if (!opponent && !margin && !winLossRaw) continue;
+
+                            // 枚数欄が数字でない場合（「不戦勝」など）は、注記として扱う
+                            let note = "";
+                            if (margin && !/^\d+(\.\d+)?$/.test(toHalf(margin))) {
+                                note = margin;
+                                margin = "";
+                            }
+                            if (!opponent) opponent = note ? `（${note}）` : "対戦相手不明";
 
                             let winLoss = "";
                             if (/[〇○◯◎勝]/.test(winLossRaw) || /^(1|win|w)$/i.test(winLossRaw)) {
@@ -973,23 +1074,25 @@ excelFileInput.addEventListener('change', async function(e) {
                                 lastWinLoss = "win";
                             } else if (/[×✕✖負]/.test(winLossRaw) || /^(0|lose|loss|l)$/i.test(winLossRaw)) {
                                 winLoss = "loss";
+                                lossCount++;
                                 lastWinLoss = "loss";
-                            } else if (/[△不]/.test(winLossRaw)) {
-                                winLoss = "";
                             }
 
                             record.matches.push({
                                 round: `${r}回戦`,
-                                opponent: opponent || "対戦相手不明",
+                                opponent,
                                 opponentSociety,
                                 winLoss,
-                                margin: margin || "0"
+                                margin: margin || (note ? "" : "0"),
+                                note
                             });
                         }
 
                         if (record.matches.length === 0) continue;
 
-                        if (lastWinLoss === "win") {
+                        if (rank) {
+                            record.result = `${rank}（${winCount}勝${lossCount}敗）`;
+                        } else if (lastWinLoss === "win") {
                             record.result = `${winCount}勝 (${record.matches.length}試合)`;
                         } else {
                             record.result = `${record.matches.length}回戦敗退`;
@@ -997,7 +1100,7 @@ excelFileInput.addEventListener('change', async function(e) {
 
                         // 同じファイルを再度取り込んでも重複しないよう、固定のIDを付ける
                         record.sheetName = sheetName;
-                        record._docId = `${tournamentName}_${sheetName}_${noStr || ("row" + rowIdx)}`.replace(/[\/\\\s.#\[\]?]+/g, "_");
+                        record._docId = `${baseName}_${sheetName}_${noStr || ("row" + rowIdx)}`.replace(/[\/\\\s.#\[\]?]+/g, "_");
                         records.push(record);
                     }
                 }
@@ -1012,9 +1115,8 @@ excelFileInput.addEventListener('change', async function(e) {
                 const fileNotes = [];
                 try {
                     const data = await readFile(file);
-                    const workbook = XLSX.read(data, { type: 'array' });
-                    const tournamentName = file.name.replace(/\.[^/.]+$/, "");
-                    const records = parseWorkbook(workbook, tournamentName, fileNotes);
+                    const workbook = XLSX.read(data, { type: 'array', cellDates: true });
+                    const records = parseWorkbook(workbook, file.name, fileNotes);
                     fileNotes.forEach(n => allNotes.push(`${file.name} ${n}`));
 
                     if (records.length === 0) {
@@ -1188,7 +1290,7 @@ excelFileInput.addEventListener('change', async function(e) {
                             </div>
                         </div>
                         <div class="text-xs font-bold ${isWin ? 'text-red-700' : 'text-blue-800'}">
-                            ${match.margin}枚差
+                            ${match.margin ? match.margin + '枚差' : (match.note || '')}
                         </div>
                     `;
                     modalMatchList.appendChild(matchEl);
