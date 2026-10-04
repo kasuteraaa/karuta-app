@@ -694,8 +694,165 @@ excelFileInput.addEventListener('change', async function(e) {
                 reader.readAsArrayBuffer(file);
             });
 
-            // 1ファイル分を解析して、保存用レコード配列を返す（保存はしない）
-            function parseWorkbook(workbook, tournamentName) {
+            // ===== 見出し行（先頭5行）から「どの列に何があるか」を判定する =====
+            const HEADER_ROWS = 5;
+            const ROUND_PATTERNS = [
+                /第?\s*([0-9一二三四五六七八九十]+)\s*回\s*戦/,
+                /第\s*([0-9一二三四五六七八九十]+)\s*戦/,
+                /(?:^|[^A-Za-z])[Rr]\s*([0-9]+)(?![0-9])/,
+                /^([0-9]+)\s*[Rr]$/
+            ];
+            const kanjiNum = (str) => {
+                const map = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+                if (/^\d+$/.test(str)) return parseInt(str, 10);
+                if (str === "十") return 10;
+                const m = str.match(/^([一二三四五六七八九])?十([一二三四五六七八九])?$/);
+                if (m) return (m[1] ? map[m[1]] : 1) * 10 + (m[2] ? map[m[2]] : 0);
+                return map[str] || null;
+            };
+            const normHead = (text) => toHalf(text).replace(/[\s　]+/g, "");
+            // 「1回戦」「一回戦」「第1回戦」「R1」などから回戦番号を取り出す
+            const roundOf = (text) => {
+                const t = toHalf(text);
+                if (!t || t.length > 14) return null;
+                for (const re of ROUND_PATTERNS) {
+                    const m = t.match(re);
+                    if (m) return kanjiNum(m[1]);
+                }
+                return null;
+            };
+            const stripRound = (text) => {
+                let t = toHalf(text);
+                for (const re of ROUND_PATTERNS) t = t.replace(re, "");
+                return t.replace(/[\s　]+/g, "");
+            };
+            // 回戦内の列の役割（相手 / 枚数差 / 勝敗 / 相手の所属）
+            const classifyRole = (text) => {
+                const t = stripRound(text);
+                if (!t) return null;
+                if (/勝数|勝ち数|勝利数|敗数|合計|順位|成績|備考/.test(t)) return "other";
+                if (/所属|かるた会|会名|団体|支部|クラブ/.test(t)) return "oppSociety";
+                if (/相手|対戦者|対戦相手/.test(t)) return "opponent";
+                if (/枚|差/.test(t)) return "margin";
+                if (/勝敗|勝負|勝ち負け|勝ち|結果|[〇○◯]×|勝|負/.test(t)) return "result";
+                if (/対戦|対|vs|選手|氏名|名前/i.test(t)) return "opponent";
+                return "other";
+            };
+            const isNoHeader = (t) => /^(no\.?|№|番号)$/i.test(t);
+            const isNameHeader = (t) => /^(選手名|氏名|名前|選手|プレイヤー名?|参加者名?)([(（].*[)）])?$/.test(t);
+            const isSocHeader = (t) => /^(所属.{0,6}|会名|団体名?|かるた会名?|支部名?|クラブ名?|チーム名?)$/.test(t);
+            const isStrictRoleHeader = (t) => /^(対戦相手|相手|相手選手|相手名|対戦者|枚数差?|枚差|枚|勝敗|勝ち負け|勝負|結果|[〇○]×|相手所属)$/.test(t);
+            const isHeaderCell = (text) => {
+                const t = normHead(text);
+                if (!t || t.length > 14) return false;
+                return isNoHeader(t) || isNameHeader(t) || isSocHeader(t) || isStrictRoleHeader(t) || roundOf(text) !== null;
+            };
+
+            function analyzeLayout(worksheet, rows) {
+                const notes = [];
+                const headRows = rows.slice(0, HEADER_ROWS);
+                const width = Math.max(0, ...headRows.map(r => (r ? r.length : 0)));
+                const grid = headRows.map(r => Array.from({ length: width }, (_, c) => cellStr(r ? r[c] : "")));
+
+                // 結合セルは、結合範囲すべてに同じ文字を入れる（横3列にまたがる「1回戦」など）
+                (worksheet['!merges'] || []).forEach(mg => {
+                    if (mg.s.r >= HEADER_ROWS) return;
+                    if (mg.e.c - mg.s.c + 1 > 6) return; // 大会名などの横長タイトルは無視
+                    const v = grid[mg.s.r] && grid[mg.s.r][mg.s.c];
+                    if (!v) return;
+                    for (let r = mg.s.r; r <= Math.min(mg.e.r, HEADER_ROWS - 1); r++) {
+                        for (let c = mg.s.c; c <= mg.e.c && c < width; c++) {
+                            if (!grid[r][c]) grid[r][c] = v;
+                        }
+                    }
+                });
+
+                // 見出し行の最後の行
+                let headerEnd = -1;
+                grid.forEach((row, r) => { if (row.some(isHeaderCell)) headerEnd = r; });
+
+                const layout = { found: headerEnd >= 0, headerEnd, noCol: null, nameCol: null, socCol: null, rounds: [], notes };
+
+                if (!layout.found) {
+                    // 見出しが読めない場合は標準配置（A=No. B=選手名 C=所属 D以降3列ずつ）
+                    layout.noCol = 0; layout.nameCol = 1; layout.socCol = 2;
+                    layout.headerEnd = -1;
+                    notes.push("見出し行を判定できなかったため標準の列配置で読み込みました");
+                    return { layout, useFixed: true };
+                }
+
+                const headerCells = (c) => {
+                    const set = new Set();
+                    for (let r = 0; r <= headerEnd; r++) if (grid[r][c]) set.add(grid[r][c]);
+                    return Array.from(set);
+                };
+
+                // 1) 各列がどの回戦に属するかを決める
+                const colInfo = {};
+                let cur = null, curStart = -1;
+                for (let c = 0; c < width; c++) {
+                    const cells = headerCells(c);
+                    let own = null;
+                    for (const t of cells) { const rn = roundOf(t); if (rn !== null) { own = rn; break; } }
+                    const text = cells.join(" ");
+                    if (own !== null) {
+                        if (own !== cur) curStart = c;
+                        cur = own;
+                        colInfo[c] = { round: own, role: classifyRole(text) };
+                    } else if (cur !== null) {
+                        const role = classifyRole(text);
+                        const empty = !normHead(text);
+                        if ((role && role !== "other" && c - curStart < 5) || (empty && c - curStart < 3)) {
+                            colInfo[c] = { round: cur, role };
+                        } else {
+                            cur = null;
+                        }
+                    }
+                }
+
+                // 2) 回戦ごとに「相手・枚数差・勝敗・相手所属」の列を割り当てる
+                const byRound = {};
+                Object.keys(colInfo).map(Number).sort((a, b) => a - b).forEach(c => {
+                    const { round, role } = colInfo[c];
+                    (byRound[round] = byRound[round] || []).push({ c, role });
+                });
+                Object.keys(byRound).map(Number).sort((a, b) => a - b).forEach(round => {
+                    const slots = {};
+                    const loose = [];
+                    byRound[round].forEach(({ c, role }) => {
+                        if (role && role !== "other") { if (slots[role] === undefined) slots[role] = c; }
+                        else if (role === null) loose.push(c);
+                    });
+                    ["opponent", "margin", "result"].forEach(key => {
+                        if (slots[key] === undefined && loose.length > 0) slots[key] = loose.shift();
+                    });
+                    if (slots.opponent !== undefined || slots.result !== undefined) {
+                        layout.rounds.push({ round, opponent: slots.opponent, margin: slots.margin, result: slots.result, oppSociety: slots.oppSociety });
+                    }
+                });
+
+                // 3) No. / 選手名 / 所属 の列（回戦に属さない列から探す）
+                for (let c = 0; c < width; c++) {
+                    if (colInfo[c]) continue;
+                    for (const t of headerCells(c).map(normHead)) {
+                        if (layout.noCol === null && isNoHeader(t)) layout.noCol = c;
+                        else if (layout.nameCol === null && isNameHeader(t)) layout.nameCol = c;
+                        else if (layout.socCol === null && isSocHeader(t)) layout.socCol = c;
+                    }
+                }
+
+                // 見つからなかった項目は標準位置で補う
+                if (layout.nameCol === null) { layout.nameCol = 1; notes.push("選手名の列が見つからずB列を使用"); }
+                if (layout.socCol === null) { layout.socCol = 2; notes.push("所属の列が見つからずC列を使用"); }
+                if (layout.rounds.length === 0) {
+                    notes.push("回戦の列が見つからず、D列から3列ずつの標準配置で読み込みました");
+                    return { layout, useFixed: true };
+                }
+                return { layout, useFixed: false };
+            }
+
+// 1ファイル分を解析して、保存用レコード配列を返す（保存はしない）
+            function parseWorkbook(workbook, tournamentName, fileNotes) {
                 const records = [];
 
                 // 級の判定：「A級」「Ａ級」「E1級」「D3級」「対戦結果表＿C級」「対戦結果_B」など、
@@ -750,19 +907,41 @@ excelFileInput.addEventListener('change', async function(e) {
                     const sheetClass = classLetter ? classLetter + "級" : "不明";
                     const maxRounds = (!classLetter || classLetter === "A" || classLetter === "B") ? 6 : 5;
 
+                    // 範囲がA1から始まらないシートでも列番号がずれないよう、読み取り範囲をA1始まりにそろえる
+                    if (worksheet['!ref']) {
+                        const rng = XLSX.utils.decode_range(worksheet['!ref']);
+                        rng.s.r = 0; rng.s.c = 0;
+                        worksheet['!ref'] = XLSX.utils.encode_range(rng);
+                    }
                     const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "", raw: true });
 
-                    for (const values of rows) {
+                    // 見出し行から列の役割を判定
+                    const analyzed = analyzeLayout(worksheet, rows);
+                    const layout = analyzed.layout;
+                    if (analyzed.useFixed) {
+                        const fixedRounds = [];
+                        for (let r = 1; r <= maxRounds; r++) {
+                            const col = 3 + (r - 1) * 3;
+                            fixedRounds.push({ round: r, opponent: col, margin: col + 1, result: col + 2, oppSociety: undefined });
+                        }
+                        layout.rounds = fixedRounds;
+                    }
+                    layout.notes.forEach(n => fileNotes.push(`${sheetName}: ${n}`));
+                    console.info("列の判定結果", sheetName, layout);
+
+                    for (let rowIdx = layout.headerEnd + 1; rowIdx < rows.length; rowIdx++) {
+                        const values = rows[rowIdx];
                         if (!values || values.length < 2) continue;
+                        const get = (c) => (c === undefined || c === null) ? "" : cellStr(values[c]);
 
-                        // A列: No.（数字の行だけを選手行とみなす）
-                        const noStr = toHalf(cellStr(values[0]));
-                        if (!/^\d+$/.test(noStr)) continue;
+                        // No.列がある場合は数字の行だけを選手行とみなす
+                        const noStr = layout.noCol !== null ? toHalf(get(layout.noCol)) : "";
+                        if (layout.noCol !== null && !/^\d+$/.test(noStr)) continue;
 
-                        // B列: 選手名 / C列: 所属
-                        const playerName = cellStr(values[1]);
-                        if (!playerName) continue;
-                        const society = cellStr(values[2]);
+                        // 選手名・所属
+                        const playerName = get(layout.nameCol);
+                        if (!playerName || isNameHeader(normHead(playerName))) continue;
+                        const society = get(layout.socCol);
 
                         const record = {
                             playerName,
@@ -777,12 +956,13 @@ excelFileInput.addEventListener('change', async function(e) {
                         let winCount = 0;
                         let lastWinLoss = "";
 
-                        // D,E,F = 1回戦（相手・枚数差・勝敗）、G,H,I = 2回戦 ...
-                        for (let r = 1; r <= maxRounds; r++) {
-                            const col = 3 + (r - 1) * 3;
-                            const opponent = cellStr(values[col]);
-                            const margin = cellStr(values[col + 1]);
-                            const winLossRaw = cellStr(values[col + 2]);
+                        // 見出しから判定した列で、各回戦の相手・枚数差・勝敗を読む
+                        for (const rc of layout.rounds) {
+                            const r = rc.round;
+                            const opponent = get(rc.opponent);
+                            const margin = get(rc.margin);
+                            const winLossRaw = get(rc.result);
+                            const opponentSociety = get(rc.oppSociety);
 
                             if (!opponent && !margin && !winLossRaw) continue;
 
@@ -801,7 +981,7 @@ excelFileInput.addEventListener('change', async function(e) {
                             record.matches.push({
                                 round: `${r}回戦`,
                                 opponent: opponent || "対戦相手不明",
-                                opponentSociety: "",
+                                opponentSociety,
                                 winLoss,
                                 margin: margin || "0"
                             });
@@ -817,7 +997,7 @@ excelFileInput.addEventListener('change', async function(e) {
 
                         // 同じファイルを再度取り込んでも重複しないよう、固定のIDを付ける
                         record.sheetName = sheetName;
-                        record._docId = `${tournamentName}_${sheetName}_${noStr}`.replace(/[\/\\\s.#\[\]?]+/g, "_");
+                        record._docId = `${tournamentName}_${sheetName}_${noStr || ("row" + rowIdx)}`.replace(/[\/\\\s.#\[\]?]+/g, "_");
                         records.push(record);
                     }
                 }
@@ -826,13 +1006,16 @@ excelFileInput.addEventListener('change', async function(e) {
 
             let totalAdded = 0;
             const failures = [];
+            const allNotes = [];
 
             for (const file of files) {
+                const fileNotes = [];
                 try {
                     const data = await readFile(file);
                     const workbook = XLSX.read(data, { type: 'array' });
                     const tournamentName = file.name.replace(/\.[^/.]+$/, "");
-                    const records = parseWorkbook(workbook, tournamentName);
+                    const records = parseWorkbook(workbook, tournamentName, fileNotes);
+                    fileNotes.forEach(n => allNotes.push(`${file.name} ${n}`));
 
                     if (records.length === 0) {
                         throw new Error("選手データ（A列がNo.の行）が見つかりませんでした。シート名: " + workbook.SheetNames.join(", "));
@@ -872,7 +1055,7 @@ excelFileInput.addEventListener('change', async function(e) {
             excelFileInput.value = '';
 
             if (failures.length === 0) {
-                setStatus(`${files.length}個のファイルから ${totalAdded} 件を取り込みました！`, 'ok');
+                setStatus(`${files.length}個のファイルから ${totalAdded} 件を取り込みました！` + (allNotes.length ? `（注意: ${allNotes.join(' / ')}）` : ''), 'ok');
             } else {
                 const head = totalAdded > 0 ? `${totalAdded} 件を取り込みましたが、` : "";
                 setStatus(`${head}読み込みに失敗したファイルがあります → ${failures.join(" / ")}`, 'error');
