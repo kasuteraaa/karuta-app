@@ -416,8 +416,6 @@
 
         // Global Firebase Configuration Setup
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'karuta-tournament-app';
-        
-        // ユーザー専用のFirebase設定
         const firebaseConfig = {
             apiKey: "AIzaSyBBiu40V3HROhyVaZlWdjdvPvqwRrK-_qA",
             authDomain: "karuta-app-58da5.firebaseapp.com",
@@ -425,7 +423,7 @@
             storageBucket: "karuta-app-58da5.firebasestorage.app",
             messagingSenderId: "92692165458",
             appId: "1:92692165458:web:0921b3a57ce0a945f1408b"
-        };
+            };
 
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
@@ -450,12 +448,7 @@
         async function initAuthAndDataSync() {
             try {
                 if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                    try {
-                        await signInWithCustomToken(auth, __initial_auth_token);
-                    } catch (tokenErr) {
-                        console.warn("Custom token mismatch, falling back to anonymous auth:", tokenErr);
-                        await signInAnonymously(auth);
-                    }
+                    await signInWithCustomToken(auth, __initial_auth_token);
                 } else {
                     await signInAnonymously(auth);
                 }
@@ -535,7 +528,106 @@
             checkAccessState();
         }
 
-        // Excel Parser Logic with Enhanced Error Handling & Flexibility
+        function checkAccessState() {
+            const lockModal = document.getElementById('accessLockModal');
+            if (isPasscodeVerified || (auth.currentUser && auth.currentUser.email === ADMIN_EMAIL)) {
+                lockModal.classList.add('hidden');
+            } else {
+                lockModal.classList.remove('hidden');
+            }
+        }
+
+        function unlockAppAccess() {
+            isPasscodeVerified = true;
+            sessionStorage.setItem('karuta_access_granted', 'true');
+            document.getElementById('accessLockModal').classList.add('hidden');
+        }
+
+        // Passcode Submission
+        document.getElementById('passcodeForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            const inputVal = document.getElementById('passcodeInput').value.trim();
+            const errorEl = document.getElementById('passcodeError');
+
+            if (inputVal === currentPasscode) {
+                errorEl.classList.add('hidden');
+                unlockAppAccess();
+            } else {
+                errorEl.classList.remove('hidden');
+            }
+        });
+
+        // Admin Auth Handlers
+        const adminModal = document.getElementById('adminModal');
+        const openAdminLoginBtn = document.getElementById('openAdminLoginBtn');
+        const openAdminPanelBtn = document.getElementById('openAdminPanelBtn');
+        const closeAdminModalBtn = document.getElementById('closeAdminModalBtn');
+        const adminGoogleSignInBtn = document.getElementById('adminGoogleSignInBtn');
+        const adminAuthError = document.getElementById('adminAuthError');
+
+        openAdminLoginBtn.addEventListener('click', () => adminModal.classList.remove('hidden'));
+        openAdminPanelBtn.addEventListener('click', () => adminModal.classList.remove('hidden'));
+        closeAdminModalBtn.addEventListener('click', () => adminModal.classList.add('hidden'));
+
+        // Admin Google Login
+        adminGoogleSignInBtn.addEventListener('click', async () => {
+            adminAuthError.classList.add('hidden');
+            const provider = new GoogleAuthProvider();
+            try {
+                const result = await signInWithPopup(auth, provider);
+                if (result.user && result.user.email === ADMIN_EMAIL) {
+                    adminModal.classList.add('hidden');
+                } else {
+                    await signOut(auth);
+                    await signInAnonymously(auth);
+                    adminAuthError.textContent = "このアカウントには管理者権限がありません。";
+                    adminAuthError.classList.remove('hidden');
+                }
+            } catch (err) {
+                console.error("Google auth error:", err);
+                if (err.code === 'auth/unauthorized-domain') {
+                    adminAuthError.innerHTML = `承認されていないドメインです。<br>Firebaseコンソール > Authentication > 設定 の「承認済みドメイン」に「${window.location.hostname}」を追加してください。`;
+                } else {
+                    adminAuthError.textContent = "ログインに失敗しました: " + (err.message || "");
+                }
+                adminAuthError.classList.remove('hidden');
+            }
+        });
+
+        // Admin Sign Out
+        document.getElementById('adminSignOutBtn').addEventListener('click', async () => {
+            await signOut(auth);
+            await signInAnonymously(auth);
+            adminModal.classList.add('hidden');
+        });
+
+        // Save New Passcode
+        document.getElementById('savePasscodeBtn').addEventListener('click', async () => {
+            const newCode = document.getElementById('newPasscodeInput').value.trim();
+            const msg = document.getElementById('passcodeUpdateMsg');
+            if (!newCode) return;
+
+            try {
+                await setDoc(settingsDocRef, {
+                    passCode: newCode,
+                    adminEmail: ADMIN_EMAIL,
+                    updatedAt: new Date().toISOString()
+                });
+                msg.classList.remove('hidden');
+                setTimeout(() => msg.classList.add('hidden'), 3000);
+            } catch (err) {
+                alert("合言葉の更新に失敗しました: " + err.message);
+            }
+        });
+
+        document.getElementById('adminClearDataBtn').addEventListener('click', () => {
+            adminModal.classList.add('hidden');
+            document.getElementById('confirmModal').classList.remove('hidden');
+        });
+
+        initAuthAndDataSync();
+
+        // Excel Parser Logic
         const excelFileInput = document.getElementById('excelFileInput');
         const importStatus = document.getElementById('importStatus');
 
@@ -549,140 +641,131 @@
             const files = e.target.files;
             if (!files || files.length === 0) return;
 
-            importStatus.textContent = "ファイルを解析してクラウドに保存しています...";
-            importStatus.classList.remove('hidden', 'text-red-600', 'text-emerald-700');
+            importStatus.textContent = "解析してクラウドに保存しています...";
+            importStatus.classList.remove('hidden', 'text-red-600');
             importStatus.classList.add('text-amber-800');
 
             let filesProcessed = 0;
             let newRecordsAdded = 0;
 
-            for (const file of Array.from(files)) {
-                try {
-                    const data = await file.arrayBuffer();
-                    const workbook = XLSX.read(data, { type: 'array' });
-                    
-                    let sheetNamesToProcess = workbook.SheetNames.filter(name => 
-                        name.includes("対戦結果") || name.match(/[A-EＡ-Ｅ]級/)
-                    );
-                    if (sheetNamesToProcess.length === 0) {
-                        sheetNamesToProcess = workbook.SheetNames;
-                    }
-
-                    let guessedTournamentName = file.name.replace(/\.[^/.]+$/, "");
-
-                    for (const sheetName of sheetNamesToProcess) {
-                        const worksheet = workbook.Sheets[sheetName];
-                        if (!worksheet) continue;
+            Array.from(files).forEach(file => {
+                const reader = new FileReader();
+                reader.onload = async function(event) {
+                    try {
+                        const data = new Uint8Array(event.target.result);
+                        const workbook = XLSX.read(data, { type: 'array' });
                         
-                        const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
-                        
-                        let sheetClass = "不明";
-                        const classMatch = sheetName.match(/([A-EＡ-Ｅ])級/);
-                        if (classMatch) {
-                            const rawClass = classMatch[1].replace(/[Ａ-Ｅ]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xfee0));
-                            sheetClass = rawClass + "級";
+                        let sheetNamesToProcess = workbook.SheetNames.filter(name => 
+                            name.includes("対戦結果") || name.match(/[A-EＡ-Ｅ]級/)
+                        );
+                        if (sheetNamesToProcess.length === 0) {
+                            sheetNamesToProcess = workbook.SheetNames;
                         }
-                        
-                        if (rows && rows.length > 0) {
-                            for (let i = 0; i < rows.length; i++) {
-                                const values = rows[i];
-                                if (!values || values.length < 2) continue;
-                                
-                                const valB = String(values[1] || "").trim();
-                                if (!valB || ["選手名", "氏名", "名前", "選手", "No.", "No", "番号", "順位"].includes(valB)) continue;
 
-                                const newRecord = {
-                                    playerName: valB,
-                                    society: String(values[2] || "").trim(),
-                                    playerClass: sheetClass,
-                                    tournamentName: guessedTournamentName,
-                                    date: new Date().toLocaleDateString('ja-JP', { year: 'numeric', month: 'short' }),
-                                    result: "",
-                                    matches: []
-                                };
-                                
-                                let roundNum = 1;
-                                let lastWinLoss = "";
-                                let winCount = 0;
+                        let guessedTournamentName = file.name.replace(/\.[^/.]+$/, "");
 
-                                for (let col = 3; col < values.length; col += 3) {
-                                    if (roundNum > 6) break;
+                        for (const sheetName of sheetNamesToProcess) {
+                            const worksheet = workbook.Sheets[sheetName];
+                            const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: "" });
+                            
+                            let sheetClass = "不明";
+                            const classMatch = sheetName.match(/([A-EＡ-Ｅ])級/);
+                            if (classMatch) {
+                                const rawClass = classMatch[1].replace(/[Ａ-Ｅ]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xfee0));
+                                sheetClass = rawClass + "級";
+                            }
+                            
+                            if (rows && rows.length > 0) {
+                                for (let i = 0; i < rows.length; i++) {
+                                    const values = rows[i];
+                                    if (!values || values.length < 2) continue;
+                                    
+                                    const valB = String(values[1] || "").trim();
+                                    if (!valB || ["選手名", "氏名", "名前", "選手", "No.", "No"].includes(valB)) continue;
 
-                                    let opponent = values[col] !== undefined ? String(values[col]).trim() : "";
-                                    let margin = values[col + 1] !== undefined ? String(values[col + 1]).trim() : "";
-                                    let winLossRaw = values[col + 2] !== undefined ? String(values[col + 2]).trim() : "";
+                                    const newRecord = {
+                                        playerName: valB,
+                                        society: String(values[2] || "").trim(),
+                                        playerClass: sheetClass,
+                                        tournamentName: guessedTournamentName,
+                                        date: new Date().toLocaleDateString('ja-JP', { year: 'numeric', month: 'short' }),
+                                        result: "",
+                                        matches: []
+                                    };
+                                    
+                                    let roundNum = 1;
+                                    let lastWinLoss = "";
+                                    let winCount = 0;
 
-                                    if (!opponent && !margin && !winLossRaw) {
+                                    for (let col = 3; col < values.length; col += 3) {
+                                        if (roundNum > 6) break;
+
+                                        let opponent = values[col] !== undefined ? String(values[col]).trim() : "";
+                                        let margin = values[col + 1] !== undefined ? String(values[col + 1]).trim() : "";
+                                        let winLossRaw = values[col + 2] !== undefined ? String(values[col + 2]).trim() : "";
+
+                                        if (!opponent && !margin && !winLossRaw) {
+                                            roundNum++;
+                                            continue;
+                                        }
+
+                                        let winLoss = "";
+                                        if (winLossRaw.includes("〇") || winLossRaw.includes("○") || winLossRaw.includes("勝") || winLossRaw.includes("1") || winLossRaw.includes("□")) {
+                                            winLoss = "win";
+                                            winCount++;
+                                            lastWinLoss = "win";
+                                        } else if (winLossRaw.includes("×") || winLossRaw.includes("負") || winLossRaw.includes("0")) {
+                                            winLoss = "loss";
+                                            lastWinLoss = "loss";
+                                        }
+
+                                        newRecord.matches.push({
+                                            round: `${roundNum}回戦`,
+                                            opponent: opponent || "対戦相手不明",
+                                            opponentSociety: "",
+                                            winLoss: winLoss,
+                                            margin: margin || "0"
+                                        });
+
                                         roundNum++;
-                                        continue;
                                     }
 
-                                    let winLoss = "";
-                                    if (winLossRaw.includes("〇") || winLossRaw.includes("○") || winLossRaw.includes("勝") || winLossRaw.includes("1") || winLossRaw.includes("□")) {
-                                        winLoss = "win";
-                                        winCount++;
-                                        lastWinLoss = "win";
-                                    } else if (winLossRaw.includes("×") || winLossRaw.includes("負") || winLossRaw.includes("0")) {
-                                        winLoss = "loss";
-                                        lastWinLoss = "loss";
-                                    }
+                                    if (newRecord.matches.length > 0) {
+                                        if (lastWinLoss === "win") {
+                                            newRecord.result = `${winCount}勝 (${newRecord.matches.length}試合)`;
+                                        } else {
+                                            newRecord.result = `${newRecord.matches.length}回戦敗退`;
+                                        }
 
-                                    newRecord.matches.push({
-                                        round: `${roundNum}回戦`,
-                                        opponent: opponent || "対戦相手不明",
-                                        opponentSociety: "",
-                                        winLoss: winLoss,
-                                        margin: margin || "0"
-                                    });
-
-                                    roundNum++;
-                                }
-
-                                if (newRecord.matches.length > 0) {
-                                    if (lastWinLoss === "win") {
-                                        newRecord.result = `${winCount}勝 (${newRecord.matches.length}試合)`;
-                                    } else {
-                                        newRecord.result = `${newRecord.matches.length}回戦敗退`;
-                                    }
-
-                                    try {
                                         if (isCloudConnected && auth.currentUser) {
                                             await addDoc(recordsColRef, newRecord);
                                         } else {
                                             appDatabase.push({ id: Date.now() + Math.random(), ...newRecord });
                                         }
                                         newRecordsAdded++;
-                                    } catch (saveErr) {
-                                        console.error("Firebase save error:", saveErr);
                                     }
                                 }
                             }
                         }
+
+                        filesProcessed++;
+                        if (filesProcessed === files.length) {
+                            importStatus.textContent = `${files.length}個のファイルから ${newRecordsAdded} 件を取り込みました！`;
+                            importStatus.classList.remove('text-amber-800', 'text-red-600');
+                            importStatus.classList.add('text-emerald-700');
+                            excelFileInput.value = '';
+                            performSearch(true);
+                        }
+                    } catch (error) {
+                        console.error("Excel parse error:", error);
+                        importStatus.textContent = "読み込みに失敗しました。ファイル構造を確認してください。";
+                        importStatus.classList.remove('text-amber-800', 'text-emerald-700');
+                        importStatus.classList.add('text-red-600');
                     }
+                };
 
-                    filesProcessed++;
-                } catch (fileErr) {
-                    console.error("Excel parse error:", fileErr);
-                    importStatus.textContent = `エラー (${file.name}): ${fileErr.message || '読み込み失敗'}`;
-                    importStatus.classList.remove('text-amber-800', 'text-emerald-700');
-                    importStatus.classList.add('text-red-600');
-                    return;
-                }
-            }
-
-            if (filesProcessed > 0) {
-                if (newRecordsAdded > 0) {
-                    importStatus.textContent = `${filesProcessed}個のファイルから ${newRecordsAdded} 件の対戦記録を取り込みました！`;
-                    importStatus.classList.remove('text-amber-800', 'text-red-600');
-                    importStatus.classList.add('text-emerald-700');
-                } else {
-                    importStatus.textContent = "ファイルは読み込めましたが、該当する対戦データが見つかりませんでした。フォーマットをご確認ください。";
-                    importStatus.classList.remove('text-amber-800', 'text-emerald-700');
-                    importStatus.classList.add('text-red-600');
-                }
-                excelFileInput.value = '';
-                performSearch(true);
-            }
+                reader.readAsArrayBuffer(file);
+            });
         });
 
         // Search & Filter Operations
