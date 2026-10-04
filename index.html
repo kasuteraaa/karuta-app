@@ -148,6 +148,12 @@
                 <h1 class="text-2xl font-bold font-karuta tracking-wide text-amber-200">競技かるた 大会記録検索</h1>
             </div>
             <p class="text-xs text-amber-100/80 text-center mt-1">全国大会・公式戦 結果データベース</p>
+
+            <div id="headerAdminLogin" class="mt-2 text-center">
+                <button id="openAdminLoginBtn2" class="text-xs bg-white/15 hover:bg-white/25 text-amber-100 px-3 py-0.5 rounded border border-amber-200/40">
+                    🔑 管理者ログイン
+                </button>
+            </div>
             
             <div id="adminBadge" class="mt-2 text-center hidden">
                 <span class="bg-amber-400 text-amber-950 text-[11px] font-bold px-3 py-0.5 rounded-full inline-flex items-center gap-1 shadow">
@@ -435,22 +441,29 @@
         let lastIsShowAll = false;
         let currentPasscode = "karuta2026"; 
         let isPasscodeVerified = false;
+        let passcodeLoaded = false;   // Firestoreから合言葉を読み込み済みか
         const ADMIN_EMAIL = "ryoseiconan@gmail.com";
 
         const recordsColRef = collection(db, 'artifacts', appId, 'public', 'data', 'tournament_records');
         const settingsDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'app_settings', 'config');
 
-        // Check local session
-        if (sessionStorage.getItem('karuta_access_granted') === 'true') {
-            isPasscodeVerified = true;
+        // 閲覧認証：入力した合言葉をタブ内に保存し、現在の合言葉と一致する間だけ有効
+        function hasValidPasscodeSession() {
+            const saved = sessionStorage.getItem('karuta_access_passcode');
+            return !!saved && saved === currentPasscode;
         }
+        sessionStorage.removeItem('karuta_access_granted'); // 旧方式の記録は破棄
 
         async function initAuthAndDataSync() {
             try {
-                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                    await signInWithCustomToken(auth, __initial_auth_token);
-                } else {
-                    await signInAnonymously(auth);
+                // 保存済みのログイン状態（管理者を含む）の復元を待つ
+                await auth.authStateReady();
+                if (!auth.currentUser) {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
                 }
 
                 document.getElementById('statusText').textContent = "クラウド接続完了";
@@ -466,30 +479,40 @@
                             currentPasscode = data.passCode;
                             document.getElementById('newPasscodeInput').value = currentPasscode;
                         }
-                    } else {
+                    } else if (auth.currentUser && auth.currentUser.email === ADMIN_EMAIL) {
+                        // 初期の合言葉を管理者のときだけ登録
                         setDoc(settingsDocRef, {
-                            passCode: "karuta2026",
+                            passCode: currentPasscode,
                             adminEmail: ADMIN_EMAIL,
                             updatedAt: new Date().toISOString()
-                        });
+                        }).catch(err => console.log("Settings init note:", err));
                     }
-                }, (err) => console.log("Settings sync note:", err));
+                    passcodeLoaded = true;
+                    checkAccessState();
+                }, (err) => {
+                    console.log("Settings sync note:", err);
+                    passcodeLoaded = true;
+                    checkAccessState();
+                });
 
                 // Auth Listener
                 onAuthStateChanged(auth, (user) => {
                     const importSection = document.getElementById('importSection');
+                    const headerLogin = document.getElementById('headerAdminLogin');
                     if (user && user.email === ADMIN_EMAIL) {
+                        if (headerLogin) headerLogin.classList.add('hidden');
                         document.getElementById('adminBadge').classList.remove('hidden');
                         document.getElementById('adminLoginForm').classList.add('hidden');
                         document.getElementById('adminControlPanel').classList.remove('hidden');
                         if (importSection) importSection.classList.remove('hidden');
-                        unlockAppAccess();
                     } else {
+                        if (headerLogin) headerLogin.classList.remove('hidden');
                         document.getElementById('adminBadge').classList.add('hidden');
                         document.getElementById('adminLoginForm').classList.remove('hidden');
                         document.getElementById('adminControlPanel').classList.add('hidden');
                         if (importSection) importSection.classList.add('hidden');
                     }
+                    checkAccessState();
                 });
 
                 // Firestore Sync
@@ -530,6 +553,7 @@
 
         function checkAccessState() {
             const lockModal = document.getElementById('accessLockModal');
+            isPasscodeVerified = hasValidPasscodeSession();
             if (isPasscodeVerified || (auth.currentUser && auth.currentUser.email === ADMIN_EMAIL)) {
                 lockModal.classList.add('hidden');
             } else {
@@ -537,10 +561,9 @@
             }
         }
 
-        function unlockAppAccess() {
-            isPasscodeVerified = true;
-            sessionStorage.setItem('karuta_access_granted', 'true');
-            document.getElementById('accessLockModal').classList.add('hidden');
+        function unlockAppAccess(code) {
+            sessionStorage.setItem('karuta_access_passcode', code);
+            checkAccessState();
         }
 
         // Passcode Submission
@@ -549,10 +572,18 @@
             const inputVal = document.getElementById('passcodeInput').value.trim();
             const errorEl = document.getElementById('passcodeError');
 
+            if (isCloudConnected && !passcodeLoaded) {
+                errorEl.textContent = "合言葉を確認中です。数秒待ってからもう一度お試しください。";
+                errorEl.classList.remove('hidden');
+                return;
+            }
+
             if (inputVal === currentPasscode) {
                 errorEl.classList.add('hidden');
-                unlockAppAccess();
+                document.getElementById('passcodeInput').value = '';
+                unlockAppAccess(inputVal);
             } else {
+                errorEl.textContent = "合言葉が正しくありません。";
                 errorEl.classList.remove('hidden');
             }
         });
@@ -566,6 +597,7 @@
         const adminAuthError = document.getElementById('adminAuthError');
 
         openAdminLoginBtn.addEventListener('click', () => adminModal.classList.remove('hidden'));
+        document.getElementById('openAdminLoginBtn2').addEventListener('click', () => adminModal.classList.remove('hidden'));
         openAdminPanelBtn.addEventListener('click', () => adminModal.classList.remove('hidden'));
         closeAdminModalBtn.addEventListener('click', () => adminModal.classList.add('hidden'));
 
