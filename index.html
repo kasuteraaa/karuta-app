@@ -204,6 +204,14 @@
                 </label>
                 <input type="file" id="excelFileInput" accept=".xls, .xlsx" multiple>
                 <div id="importStatus" class="text-xs mt-2 font-bold text-emerald-700 hidden"></div>
+
+                <div class="mt-4 pt-3 border-t border-amber-300/50">
+                    <h4 class="text-xs font-bold text-amber-950 mb-1.5 font-karuta">🗑 ファイル単位でデータを削除</h4>
+                    <div class="flex gap-2 items-center">
+                        <select id="deleteFileSelect" class="flex-1 min-w-0 rounded-md border border-amber-300 p-1.5 text-xs bg-white"></select>
+                        <button id="deleteFileBtn" class="bg-red-700 hover:bg-red-800 text-white px-3 py-1.5 rounded-md text-xs font-bold disabled:opacity-40" disabled>削除</button>
+                    </div>
+                </div>
             </div>
 
             <!-- Search Box -->
@@ -560,6 +568,7 @@
                     });
 
                     hideBootLoading();
+                    refreshFileList();
                     document.getElementById('recordCountBadge').textContent = `保存数: ${appDatabase.length}件`;
                     
                     if (appDatabase.length > 0) {
@@ -1159,6 +1168,7 @@ excelFileInput.addEventListener('change', async function(e) {
 
                         // 同じファイルを再度取り込んでも重複しないよう、固定のIDを付ける
                         record.sheetName = sheetName;
+                        record.sourceFile = baseName;
                         record._docId = `${baseName}_${sheetName}_${noStr || ("row" + rowIdx)}`.replace(/[\/\\\s.#\[\]?]+/g, "_");
                         records.push(record);
                     }
@@ -1204,6 +1214,7 @@ excelFileInput.addEventListener('change', async function(e) {
                             const item = { id: _docId, ...payload };
                             if (idx >= 0) appDatabase[idx] = item; else appDatabase.push(item);
                         });
+                        refreshFileList();
                     }
                     totalAdded += records.length;
                 } catch (error) {
@@ -1422,6 +1433,86 @@ excelFileInput.addEventListener('change', async function(e) {
             } catch (err) {
                 console.error("Delete error:", err);
                 document.getElementById('statusText').textContent = "消去エラーが発生しました";
+            }
+        });
+
+        // ===== ファイル単位のデータ削除（管理者のみ） =====
+        const deleteFileSelect = document.getElementById('deleteFileSelect');
+        const deleteFileBtn = document.getElementById('deleteFileBtn');
+
+        // レコードがどのファイルから取り込まれたかを返す（古いデータはIDから復元）
+        function getSourceFile(rec) {
+            if (rec.sourceFile) return rec.sourceFile;
+            if (rec.sheetName && rec.id) {
+                const san = rec.sheetName.replace(/[\/\\\s.#\[\]?]+/g, "_");
+                const i = rec.id.lastIndexOf(`_${san}_`);
+                if (i > 0) return rec.id.slice(0, i);
+            }
+            return `（ファイル名不明）${rec.tournamentName || ''}`;
+        }
+
+        function refreshFileList() {
+            const prev = deleteFileSelect.value;
+            const counts = new Map();
+            appDatabase.forEach(r => {
+                const k = getSourceFile(r);
+                counts.set(k, (counts.get(k) || 0) + 1);
+            });
+            deleteFileSelect.innerHTML = '';
+            if (counts.size === 0) {
+                deleteFileSelect.innerHTML = '<option value="">（取り込み済みのファイルはありません）</option>';
+                deleteFileBtn.disabled = true;
+                return;
+            }
+            deleteFileSelect.insertAdjacentHTML('beforeend', '<option value="">削除するファイルを選択…</option>');
+            Array.from(counts.keys()).sort((a, b) => a.localeCompare(b, 'ja')).forEach(k => {
+                const opt = document.createElement('option');
+                opt.value = k;
+                opt.textContent = `${k}（${counts.get(k)}件）`;
+                deleteFileSelect.appendChild(opt);
+            });
+            if (counts.has(prev)) deleteFileSelect.value = prev;
+            deleteFileBtn.disabled = !deleteFileSelect.value;
+        }
+        deleteFileSelect.addEventListener('change', () => { deleteFileBtn.disabled = !deleteFileSelect.value; });
+
+        deleteFileBtn.addEventListener('click', async () => {
+            if (!auth.currentUser || auth.currentUser.email !== ADMIN_EMAIL) {
+                alert("削除する権限がありません。管理者としてログインしてください。");
+                return;
+            }
+            const key = deleteFileSelect.value;
+            if (!key) return;
+            const ids = appDatabase.filter(r => getSourceFile(r) === key).map(r => r.id);
+            if (ids.length === 0) return;
+            if (!confirm(`「${key}」から取り込んだデータ ${ids.length} 件を削除します。\nこの操作は元に戻せません。よろしいですか？`)) return;
+
+            deleteFileBtn.disabled = true;
+            const showStatus = (text, cls) => {
+                importStatus.textContent = text;
+                importStatus.classList.remove('hidden', 'text-amber-800', 'text-red-600', 'text-emerald-700');
+                importStatus.classList.add(cls);
+            };
+            showStatus("削除しています...", 'text-amber-800');
+            try {
+                if (isCloudConnected) {
+                    for (let i = 0; i < ids.length; i += 400) {
+                        const batch = writeBatch(db);
+                        ids.slice(i, i + 400).forEach(id => batch.delete(doc(recordsColRef, id)));
+                        await batch.commit();
+                    }
+                }
+                const idSet = new Set(ids);
+                appDatabase = appDatabase.filter(r => !idSet.has(r.id));
+                document.getElementById('recordCountBadge').textContent = `保存数: ${appDatabase.length}件`;
+                refreshFileList();
+                if (lastSearchQuery || lastIsShowAll) performSearch(lastIsShowAll);
+                showStatus(`「${key}」のデータ ${ids.length} 件を削除しました。`, 'text-red-600');
+            } catch (err) {
+                console.error("File delete error:", err);
+                const reason = err && err.code === 'permission-denied' ? "Firestoreの削除権限がありません（セキュリティルールを確認してください）" : (err && err.message) || String(err);
+                showStatus(`削除に失敗しました：${reason}`, 'text-red-600');
+                deleteFileBtn.disabled = !deleteFileSelect.value;
             }
         });
 
