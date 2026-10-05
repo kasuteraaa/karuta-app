@@ -188,6 +188,14 @@
                     <span class="text-[10px] bg-amber-200 text-amber-900 px-2 py-0.5 rounded font-bold">管理者限定</span>
                 </div>
                 <p class="text-xs text-amber-900/80 mb-3">取り込んだデータはクラウドに自動保存され、一般ユーザーの検索画面に即時反映されます。</p>
+                <div class="flex flex-wrap items-center gap-1.5 mb-1 text-xs text-amber-950">
+                    <span class="font-bold">開催年月:</span>
+                    <select id="importYear" class="rounded-md border border-amber-300 p-1 text-xs bg-white font-medium"></select>
+                    <span>年</span>
+                    <select id="importMonth" class="rounded-md border border-amber-300 p-1 text-xs bg-white font-medium"></select>
+                    <span>月</span>
+                </div>
+                <p class="text-[10px] text-amber-900/70 mb-3">ファイルを選ぶ前に設定してください。「自動判定」はファイル内の日付から推定します。選んだ年月は、今回取り込むすべてのファイルに付きます。</p>
                 <label for="excelFileInput" class="import-btn">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline-block mr-1 -mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
@@ -219,6 +227,11 @@
                             <option value="C級">C級</option>
                             <option value="D級">D級</option>
                             <option value="E級">E級</option>
+                        </select>
+                        <label for="sortOrder" class="text-xs font-bold text-stone-600 ml-2">並び順:</label>
+                        <select id="sortOrder" class="rounded-md border-stone-300 p-1.5 border text-xs bg-stone-50 font-medium">
+                            <option value="desc">新しい順</option>
+                            <option value="asc">古い順</option>
                         </select>
                     </div>
                     <div class="flex items-center gap-2">
@@ -264,6 +277,13 @@
                 <div id="resultsContainer" class="space-y-3"></div>
             </div>
         </main>
+    </div>
+
+    <!-- Now Loading Overlay (クラウドからの初回読み込み中に表示) -->
+    <div id="bootLoading" style="position:fixed;inset:0;z-index:40;background:#f4efe6;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+        <div class="animate-spin rounded-full h-10 w-10 border-b-2 border-amber-700"></div>
+        <p class="mt-4 text-lg font-bold text-amber-900 font-karuta tracking-wider">Now loading<span id="bootDots">...</span></p>
+        <p class="mt-1 text-xs text-stone-500">クラウドからデータを読み込んでいます</p>
     </div>
 
     <!-- Match Detail Modal -->
@@ -437,6 +457,20 @@
 
         let appDatabase = [];
         let isCloudConnected = false;
+
+        // ===== Now loading 表示 =====
+        const bootLoadingEl = document.getElementById('bootLoading');
+        const bootDotsTimer = setInterval(() => {
+            const d = document.getElementById('bootDots');
+            if (d) d.textContent = ".".repeat(((d.textContent.length) % 3) + 1);
+        }, 400);
+        function hideBootLoading() {
+            if (!bootLoadingEl || bootLoadingEl.dataset.done) return;
+            bootLoadingEl.dataset.done = "1";
+            clearInterval(bootDotsTimer);
+            bootLoadingEl.style.display = 'none';
+        }
+        setTimeout(hideBootLoading, 30000); // 万一の保険：30秒で必ず消す
         let lastSearchQuery = "";
         let lastIsShowAll = false;
         let currentPasscode = "karuta2026"; 
@@ -525,6 +559,7 @@
                         });
                     });
 
+                    hideBootLoading();
                     document.getElementById('recordCountBadge').textContent = `保存数: ${appDatabase.length}件`;
                     
                     if (appDatabase.length > 0) {
@@ -538,12 +573,14 @@
                     }
                 }, (error) => {
                     console.error("Firestore sync error:", error);
+                    hideBootLoading();
                     document.getElementById('statusText').textContent = "オフライン表示中";
                     document.getElementById('statusDot').className = "relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500";
                 });
 
             } catch (err) {
                 console.error("Auth error:", err);
+                hideBootLoading();
                 document.getElementById('statusText').textContent = "接続エラー";
                 document.getElementById('statusDot').className = "relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500";
             }
@@ -660,6 +697,17 @@
         initAuthAndDataSync();
 
         // Excel Parser Logic
+        // 開催年月の選択肢を用意
+        const importYearSel = document.getElementById('importYear');
+        const importMonthSel = document.getElementById('importMonth');
+        (function buildDateSelects() {
+            const thisYear = new Date().getFullYear();
+            importYearSel.innerHTML = '<option value="">自動判定</option>';
+            for (let y = thisYear + 1; y >= 2000; y--) importYearSel.insertAdjacentHTML('beforeend', `<option value="${y}">${y}</option>`);
+            importMonthSel.innerHTML = '<option value="">自動判定</option>';
+            for (let m = 1; m <= 12; m++) importMonthSel.insertAdjacentHTML('beforeend', `<option value="${m}">${m}</option>`);
+        })();
+
         const excelFileInput = document.getElementById('excelFileInput');
         const importStatus = document.getElementById('importStatus');
 
@@ -904,7 +952,8 @@ excelFileInput.addEventListener('change', async function(e) {
                 }
                 return null;
             }
-            function detectDateLabel(workbook, baseName) {
+            // ファイル内から開催年月を推定して { y, m } を返す（月が不明なら m = 0、全く不明なら null）
+            function detectDate(workbook, baseName) {
                 const sheets = workbook.SheetNames.map(n => workbook.Sheets[n]).filter(Boolean);
                 // ① 「2026年9月」のような文字
                 for (const ws of sheets) {
@@ -912,7 +961,7 @@ excelFileInput.addEventListener('change', async function(e) {
                         for (const cell of row) {
                             if (typeof cell !== "string") continue;
                             const m = toHalf(cell).match(/(20\d{2})\s*年\s*(\d{1,2})\s*月/);
-                            if (m) return `${m[1]}年${parseInt(m[2], 10)}月`;
+                            if (m) return { y: parseInt(m[1], 10), m: parseInt(m[2], 10) };
                         }
                     }
                 }
@@ -922,7 +971,7 @@ excelFileInput.addEventListener('change', async function(e) {
                         for (const cell of row) {
                             if (cell instanceof Date && !isNaN(cell)) {
                                 const d = new Date(cell.getTime() + 12 * 3600 * 1000);
-                                if (d.getFullYear() >= 2000) return `${d.getFullYear()}年${d.getMonth() + 1}月`;
+                                if (d.getFullYear() >= 2000) return { y: d.getFullYear(), m: d.getMonth() + 1 };
                             }
                         }
                     }
@@ -933,22 +982,29 @@ excelFileInput.addEventListener('change', async function(e) {
                         for (const cell of row) {
                             if (typeof cell === "number" && Number.isInteger(cell) && cell >= 43831 && cell <= 47848) {
                                 const d = new Date(Date.UTC(1899, 11, 30) + cell * 86400000);
-                                return `${d.getUTCFullYear()}年${d.getUTCMonth() + 1}月`;
+                                return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1 };
                             }
                         }
                     }
                 }
                 // ③ ファイル名の年
                 const y = toHalf(baseName).match(/(20\d{2})/);
-                return y ? `${y[1]}年` : null;
+                return y ? { y: parseInt(y[1], 10), m: 0 } : null;
             }
 
             // 1ファイル分を解析して、保存用レコード配列を返す（保存はしない）
-            function parseWorkbook(workbook, fileName, fileNotes) {
+            function parseWorkbook(workbook, fileName, fileNotes, dateOverride) {
                 const records = [];
                 const baseName = fileName.replace(/\.[^/.]+$/, "");
                 const tournamentName = detectTournamentTitle(workbook) || cleanFileName(baseName);
-                const dateLabel = detectDateLabel(workbook, baseName) || new Date().toLocaleDateString('ja-JP', { year: 'numeric', month: 'short' });
+                // 開催年月：管理者が選んだ値を優先し、「自動判定」の項目はファイルから推定する
+                const now = new Date();
+                const detected = detectDate(workbook, baseName) || { y: now.getFullYear(), m: now.getMonth() + 1 };
+                const ov = dateOverride || {};
+                const evYear = ov.y || detected.y;
+                const evMonth = ov.m ? ov.m : (ov.y && ov.y !== detected.y ? 0 : detected.m);
+                const dateLabel = evMonth ? `${evYear}年${evMonth}月` : `${evYear}年`;
+                const eventKey = evYear * 100 + evMonth; // 並べ替え用（例: 202609）
 
                 // 全シートを見出しの中身で解析する（シート名には頼らない）
                 const analyzed = [];
@@ -1040,6 +1096,9 @@ excelFileInput.addEventListener('change', async function(e) {
                             playerClass: sheetClass,
                             tournamentName,
                             date: dateLabel,
+                            eventYear: evYear,
+                            eventMonth: evMonth,
+                            eventKey,
                             result: "",
                             matches: []
                         };
@@ -1110,13 +1169,18 @@ excelFileInput.addEventListener('change', async function(e) {
             let totalAdded = 0;
             const failures = [];
             const allNotes = [];
+            const usedDates = new Set();
 
             for (const file of files) {
                 const fileNotes = [];
                 try {
                     const data = await readFile(file);
                     const workbook = XLSX.read(data, { type: 'array', cellDates: true });
-                    const records = parseWorkbook(workbook, file.name, fileNotes);
+                    const records = parseWorkbook(workbook, file.name, fileNotes, {
+                        y: parseInt(importYearSel.value, 10) || 0,
+                        m: parseInt(importMonthSel.value, 10) || 0
+                    });
+                    if (records.length > 0) usedDates.add(records[0].date);
                     fileNotes.forEach(n => allNotes.push(`${file.name} ${n}`));
 
                     if (records.length === 0) {
@@ -1157,7 +1221,7 @@ excelFileInput.addEventListener('change', async function(e) {
             excelFileInput.value = '';
 
             if (failures.length === 0) {
-                setStatus(`${files.length}個のファイルから ${totalAdded} 件を取り込みました！` + (allNotes.length ? `（注意: ${allNotes.join(' / ')}）` : ''), 'ok');
+                setStatus(`${files.length}個のファイルから ${totalAdded} 件を取り込みました！（開催年月: ${Array.from(usedDates).join('・')}）` + (allNotes.length ? `（注意: ${allNotes.join(' / ')}）` : ''), 'ok');
             } else {
                 const head = totalAdded > 0 ? `${totalAdded} 件を取り込みましたが、` : "";
                 setStatus(`${head}読み込みに失敗したファイルがあります → ${failures.join(" / ")}`, 'error');
@@ -1176,6 +1240,30 @@ excelFileInput.addEventListener('change', async function(e) {
         const resultsHeader = document.getElementById('resultsHeader');
         const resultCount = document.getElementById('resultCount');
         const showAllBtn = document.getElementById('showAllBtn');
+
+        const sortOrder = document.getElementById('sortOrder');
+
+        // 開催年月の並べ替え用の値（古いデータは「2026年9月」の文字から復元。不明なら0）
+        function getEventKey(record) {
+            if (typeof record.eventKey === 'number') return record.eventKey;
+            const m = String(record.date || '').match(/(\d{4})\s*年\s*(?:(\d{1,2})\s*月)?/);
+            return m ? parseInt(m[1], 10) * 100 + (m[2] ? parseInt(m[2], 10) : 0) : 0;
+        }
+        function sortResults(list) {
+            const dir = sortOrder.value === 'asc' ? 1 : -1;
+            const classRank = (c) => { const i = ['A級', 'B級', 'C級', 'D級', 'E級'].indexOf(c); return i < 0 ? 9 : i; };
+            return list.slice().sort((a, b) => {
+                const ka = getEventKey(a), kb = getEventKey(b);
+                if (ka !== kb) {
+                    if (!ka) return 1;   // 年月が不明なものは常に最後
+                    if (!kb) return -1;
+                    return (ka - kb) * dir;
+                }
+                return (a.tournamentName || '').localeCompare(b.tournamentName || '', 'ja')
+                    || classRank(a.playerClass) - classRank(b.playerClass)
+                    || (a.playerName || '').localeCompare(b.playerName || '', 'ja');
+            });
+        }
 
         function performSearch(showAll = false) {
             lastIsShowAll = showAll;
@@ -1214,7 +1302,7 @@ excelFileInput.addEventListener('change', async function(e) {
                     resultCount.textContent = "0件";
                 } else {
                     resultCount.textContent = `${results.length}件表示`;
-                    renderResults(results);
+                    renderResults(sortResults(results));
                 }
             }, 100);
         }
@@ -1339,6 +1427,9 @@ excelFileInput.addEventListener('change', async function(e) {
 
         // Event Listeners Setup
         searchButton.addEventListener('click', () => performSearch(false));
+        sortOrder.addEventListener('change', () => {
+            if (lastSearchQuery || lastIsShowAll) performSearch(lastIsShowAll);
+        });
         showAllBtn.addEventListener('click', () => performSearch(true));
         
         searchInput.addEventListener('keypress', function (e) {
