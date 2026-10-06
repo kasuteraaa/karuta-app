@@ -206,6 +206,9 @@
                 <div id="importStatus" class="text-xs mt-2 font-bold text-emerald-700 hidden"></div>
 
                 <div class="mt-4 pt-3 border-t border-amber-300/50">
+                    <h4 class="text-xs font-bold text-amber-950 mb-1 font-karuta">⚡ 既存データを高速検索用に変換</h4>
+                    <p class="text-[10px] text-amber-900/70 mb-1.5">以前に取り込んだデータは、一度だけ変換すると高速に検索できます（新しく取り込むデータは自動で対応済みです）。</p>
+                    <button id="migrateBtn" class="bg-amber-700 hover:bg-amber-800 text-white px-3 py-1.5 rounded-md text-xs font-bold mb-4 disabled:opacity-40">変換を実行</button>
                     <h4 class="text-xs font-bold text-amber-950 mb-1.5 font-karuta">🗑 ファイル単位でデータを削除</h4>
                     <div class="flex gap-2 items-center">
                         <select id="deleteFileSelect" class="flex-1 min-w-0 rounded-md border border-amber-300 p-1.5 text-xs bg-white"></select>
@@ -250,7 +253,7 @@
                             スマホで開く
                         </button>
                         <button id="showAllBtn" class="text-xs bg-stone-200 hover:bg-stone-300 text-stone-800 py-1.5 px-3 rounded-md font-bold transition">
-                            登録データ全件表示
+                            登録データ一覧を表示
                         </button>
                     </div>
                 </div>
@@ -288,7 +291,7 @@
     </div>
 
     <!-- Now Loading Overlay (クラウドからの初回読み込み中に表示) -->
-    <div id="bootLoading" style="position:fixed;inset:0;z-index:40;background:#f4efe6;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+    <div id="bootLoading" style="position:fixed;inset:0;z-index:60;background:#f4efe6;display:flex;flex-direction:column;align-items:center;justify-content:center;">
         <div class="animate-spin rounded-full h-10 w-10 border-b-2 border-amber-700"></div>
         <p class="mt-4 text-lg font-bold text-amber-900 font-karuta tracking-wider">Now loading<span id="bootDots">...</span></p>
         <p class="mt-1 text-xs text-stone-500">クラウドからデータを読み込んでいます</p>
@@ -446,7 +449,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, getDoc, onSnapshot, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, getDoc, onSnapshot, writeBatch, query as fsQuery, where, limit, orderBy, getCountFromServer } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Global Firebase Configuration Setup
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'karuta-tournament-app';
@@ -488,6 +491,46 @@
 
         const recordsColRef = collection(db, 'artifacts', appId, 'public', 'data', 'tournament_records');
         const settingsDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'app_settings', 'config');
+        const settingsColRef = collection(db, 'artifacts', appId, 'public', 'data', 'app_settings');
+        const SEARCH_LIMIT = 500;     // 1回の検索で取得する最大件数
+        const SHOW_ALL_LIMIT = 300;   // 一覧表示で取得する最大件数
+        let lastFiltered = null;      // 直前の検索結果（並び順の切り替え用）
+        let searchSeq = 0;
+
+        // ===== 検索用キー：名前・所属・大会名の「4文字までの部分文字列」を保存しておき、
+        //       クラウド側で絞り込んで必要な分だけ取得する（全件を読み込まない） =====
+        const SEARCH_KEY_LEN = 4;
+        function normForSearch(text) {
+            return String(text || '').toLowerCase().replace(/[\s　]+/g, '');
+        }
+        function buildSearchKeys(rec) {
+            const keys = new Set();
+            [rec.playerName, rec.society, rec.tournamentName].forEach(field => {
+                const t = normForSearch(field).slice(0, 60);
+                for (let i = 0; i < t.length; i++) {
+                    for (let j = i + 1; j <= Math.min(t.length, i + SEARCH_KEY_LEN); j++) keys.add(t.slice(i, j));
+                }
+            });
+            return Array.from(keys);
+        }
+        const fileRegId = (key) => 'file__' + String(key).replace(/[\/\\\s.#\[\]?]+/g, '_');
+
+        // 保存件数（集計のみを取得するので軽い）
+        async function refreshRecordCount() {
+            let total = null;
+            try {
+                if (isCloudConnected) {
+                    const snap = await getCountFromServer(recordsColRef);
+                    total = snap.data().count;
+                } else {
+                    total = appDatabase.length;
+                }
+            } catch (e) {
+                console.log("count note:", e);
+            }
+            document.getElementById('recordCountBadge').textContent = total === null ? '保存数: -' : `保存数: ${total}件`;
+            document.getElementById('clearDataBtn').classList.toggle('hidden', !(total > 0));
+        }
 
         // 閲覧認証：入力した合言葉をタブ内に保存し、現在の合言葉と一致する間だけ有効
         function hasValidPasscodeSession() {
@@ -547,6 +590,7 @@
                         document.getElementById('adminLoginForm').classList.add('hidden');
                         document.getElementById('adminControlPanel').classList.remove('hidden');
                         if (importSection) importSection.classList.remove('hidden');
+                        refreshFileList();
                     } else {
                         if (headerLogin) headerLogin.classList.remove('hidden');
                         document.getElementById('adminBadge').classList.add('hidden');
@@ -557,35 +601,9 @@
                     checkAccessState();
                 });
 
-                // Firestore Sync
-                onSnapshot(recordsColRef, (snapshot) => {
-                    appDatabase = [];
-                    snapshot.forEach((docSnap) => {
-                        appDatabase.push({
-                            id: docSnap.id,
-                            ...docSnap.data()
-                        });
-                    });
-
-                    hideBootLoading();
-                    refreshFileList();
-                    document.getElementById('recordCountBadge').textContent = `保存数: ${appDatabase.length}件`;
-                    
-                    if (appDatabase.length > 0) {
-                        document.getElementById('clearDataBtn').classList.remove('hidden');
-                    } else {
-                        document.getElementById('clearDataBtn').classList.add('hidden');
-                    }
-
-                    if (lastSearchQuery || lastIsShowAll) {
-                        performSearch(lastIsShowAll);
-                    }
-                }, (error) => {
-                    console.error("Firestore sync error:", error);
-                    hideBootLoading();
-                    document.getElementById('statusText').textContent = "オフライン表示中";
-                    document.getElementById('statusDot').className = "relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500";
-                });
+                // 全件は読み込まない（検索のたびに必要な分だけ取得する）
+                refreshRecordCount();
+                hideBootLoading();
 
             } catch (err) {
                 console.error("Auth error:", err);
@@ -1169,6 +1187,7 @@ excelFileInput.addEventListener('change', async function(e) {
                         // 同じファイルを再度取り込んでも重複しないよう、固定のIDを付ける
                         record.sheetName = sheetName;
                         record.sourceFile = baseName;
+                        record.searchKeys = buildSearchKeys(record);
                         record._docId = `${baseName}_${sheetName}_${noStr || ("row" + rowIdx)}`.replace(/[\/\\\s.#\[\]?]+/g, "_");
                         records.push(record);
                     }
@@ -1207,6 +1226,15 @@ excelFileInput.addEventListener('change', async function(e) {
                             });
                             await batch.commit();
                         }
+                        // 取り込み済みファイルの一覧（削除用）に登録
+                        await setDoc(doc(settingsColRef, fileRegId(records[0].sourceFile)), {
+                            kind: 'file',
+                            sourceFile: records[0].sourceFile,
+                            count: records.length,
+                            tournamentName: records[0].tournamentName,
+                            date: records[0].date,
+                            updatedAt: new Date().toISOString()
+                        });
                     } else {
                         records.forEach(rec => {
                             const { _docId, ...payload } = rec;
@@ -1237,7 +1265,11 @@ excelFileInput.addEventListener('change', async function(e) {
                 const head = totalAdded > 0 ? `${totalAdded} 件を取り込みましたが、` : "";
                 setStatus(`${head}読み込みに失敗したファイルがあります → ${failures.join(" / ")}`, 'error');
             }
-            if (totalAdded > 0) performSearch(true);
+            if (totalAdded > 0) {
+                refreshRecordCount();
+                refreshFileList();
+                if (lastSearchQuery || lastIsShowAll) performSearch(lastIsShowAll);
+            }
         });
 
         // Search & Filter Operations
@@ -1276,46 +1308,65 @@ excelFileInput.addEventListener('change', async function(e) {
             });
         }
 
-        function performSearch(showAll = false) {
+        async function performSearch(showAll = false) {
             lastIsShowAll = showAll;
             const rawQuery = searchInput.value.trim();
             lastSearchQuery = rawQuery;
-            const query = rawQuery.toLowerCase().replace(/[\s　]+/g, '');
+            const q = normForSearch(rawQuery);
             const filterValue = classFilter.value;
-            
-            if (!query && !showAll) return;
 
+            if (!q && !showAll) return;
+
+            const seq = ++searchSeq;
             initialMessage.classList.add('hidden');
             resultsContainer.innerHTML = '';
             emptyMessage.classList.add('hidden');
             loadingIndicator.classList.remove('hidden');
-            resultsHeader.querySelector('span').textContent = showAll ? "保存データ全件一覧" : `「${rawQuery}」の検索結果`;
+            resultsHeader.querySelector('span').textContent = showAll ? `登録データ一覧（${sortOrder.value === 'asc' ? '古い' : '新しい'}順に最大${SHOW_ALL_LIMIT}件）` : `「${rawQuery}」の検索結果`;
 
-            setTimeout(() => {
-                const results = appDatabase.filter(record => {
-                    const cleanName = (record.playerName || "").toLowerCase().replace(/[\s　]+/g, '');
-                    const cleanSociety = (record.society || "").toLowerCase().replace(/[\s　]+/g, '');
-                    const cleanTournament = (record.tournamentName || "").toLowerCase().replace(/[\s　]+/g, '');
-                    
-                    const matchQuery = showAll || 
-                        cleanName.includes(query) || 
-                        cleanSociety.includes(query) || 
-                        cleanTournament.includes(query);
-                    
-                    const matchClass = filterValue === 'all' || record.playerClass === filterValue;
-                    return matchQuery && matchClass;
-                });
-
-                loadingIndicator.classList.add('hidden');
-
-                if (results.length === 0) {
-                    emptyMessage.classList.remove('hidden');
-                    resultCount.textContent = "0件";
+            let candidates = [];
+            let truncated = false;
+            try {
+                if (isCloudConnected) {
+                    const maxCount = showAll ? SHOW_ALL_LIMIT : SEARCH_LIMIT;
+                    const qr = showAll
+                        ? fsQuery(recordsColRef, orderBy('eventKey', sortOrder.value === 'asc' ? 'asc' : 'desc'), limit(maxCount))
+                        : fsQuery(recordsColRef, where('searchKeys', 'array-contains', q.slice(0, SEARCH_KEY_LEN)), limit(maxCount));
+                    const snap = await getDocs(qr);
+                    candidates = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                    truncated = snap.size >= maxCount;
                 } else {
-                    resultCount.textContent = `${results.length}件表示`;
-                    renderResults(sortResults(results));
+                    candidates = appDatabase;
                 }
-            }, 100);
+            } catch (err) {
+                console.error("Search error:", err);
+                if (seq !== searchSeq) return;
+                loadingIndicator.classList.add('hidden');
+                emptyMessage.classList.remove('hidden');
+                resultCount.textContent = "取得に失敗しました";
+                return;
+            }
+            if (seq !== searchSeq) return; // 新しい検索が始まっていたら捨てる
+
+            const results = candidates.filter(record => {
+                const matchQuery = showAll ||
+                    normForSearch(record.playerName).includes(q) ||
+                    normForSearch(record.society).includes(q) ||
+                    normForSearch(record.tournamentName).includes(q);
+                const matchClass = filterValue === 'all' || record.playerClass === filterValue;
+                return matchQuery && matchClass;
+            });
+            lastFiltered = results;
+
+            loadingIndicator.classList.add('hidden');
+
+            if (results.length === 0) {
+                emptyMessage.classList.remove('hidden');
+                resultCount.textContent = "0件";
+            } else {
+                resultCount.textContent = `${results.length}件表示` + (truncated ? "（上限のため一部のみ。名前などで絞り込んでください）" : "");
+                renderResults(sortResults(results));
+            }
         }
 
         function renderResults(results) {
@@ -1417,28 +1468,46 @@ excelFileInput.addEventListener('change', async function(e) {
         executeClearBtn.addEventListener('click', async () => {
             confirmModal.classList.add('hidden');
             document.getElementById('statusText').textContent = "データ消去中...";
-            
+
             try {
+                if (!auth.currentUser || auth.currentUser.email !== ADMIN_EMAIL) throw new Error("管理者権限がありません");
                 const snapshot = await getDocs(recordsColRef);
-                const deletePromises = snapshot.docs.map(docSnap => deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'tournament_records', docSnap.id)));
-                await Promise.all(deletePromises);
-                
+                const refs = snapshot.docs.map(d => d.ref);
+                for (let i = 0; i < refs.length; i += 400) {
+                    const batch = writeBatch(db);
+                    refs.slice(i, i + 400).forEach(r => batch.delete(r));
+                    await batch.commit();
+                }
+                // 取り込み済みファイルの一覧も消す
+                const regSnap = await getDocs(settingsColRef);
+                const regRefs = regSnap.docs.filter(d => d.data().kind === 'file').map(d => d.ref);
+                if (regRefs.length) {
+                    const batch = writeBatch(db);
+                    regRefs.forEach(r => batch.delete(r));
+                    await batch.commit();
+                }
+
                 appDatabase = [];
+                lastFiltered = null;
                 resultsContainer.innerHTML = '';
                 initialMessage.classList.remove('hidden');
                 document.getElementById('statusText').textContent = "クラウド接続完了";
                 importStatus.textContent = "すべてのデータを消去しました。";
                 importStatus.classList.remove('hidden', 'text-amber-800', 'text-emerald-700');
                 importStatus.classList.add('text-red-600');
+                refreshRecordCount();
+                refreshFileList();
             } catch (err) {
                 console.error("Delete error:", err);
                 document.getElementById('statusText').textContent = "消去エラーが発生しました";
             }
         });
 
-        // ===== ファイル単位のデータ削除（管理者のみ） =====
+        // ===== ファイル単位のデータ削除・既存データの変換（管理者のみ） =====
         const deleteFileSelect = document.getElementById('deleteFileSelect');
         const deleteFileBtn = document.getElementById('deleteFileBtn');
+        const migrateBtn = document.getElementById('migrateBtn');
+        const isAdminNow = () => !!(auth.currentUser && auth.currentUser.email === ADMIN_EMAIL);
 
         // レコードがどのファイルから取り込まれたかを返す（古いデータはIDから復元）
         function getSourceFile(rec) {
@@ -1451,75 +1520,145 @@ excelFileInput.addEventListener('change', async function(e) {
             return `（ファイル名不明）${rec.tournamentName || ''}`;
         }
 
-        function refreshFileList() {
+        function showImportStatus(text, cls) {
+            importStatus.textContent = text;
+            importStatus.classList.remove('hidden', 'text-amber-800', 'text-red-600', 'text-emerald-700');
+            importStatus.classList.add(cls);
+        }
+
+        async function refreshFileList() {
             const prev = deleteFileSelect.value;
-            const counts = new Map();
-            appDatabase.forEach(r => {
-                const k = getSourceFile(r);
-                counts.set(k, (counts.get(k) || 0) + 1);
-            });
+            const entries = [];
+            try {
+                if (isCloudConnected) {
+                    if (!isAdminNow()) return;
+                    const snap = await getDocs(settingsColRef);
+                    snap.forEach(d => {
+                        const x = d.data();
+                        if (x.kind === 'file') entries.push({ key: x.sourceFile, count: x.count });
+                    });
+                } else {
+                    const counts = new Map();
+                    appDatabase.forEach(r => { const k = getSourceFile(r); counts.set(k, (counts.get(k) || 0) + 1); });
+                    counts.forEach((count, key) => entries.push({ key, count }));
+                }
+            } catch (e) {
+                console.log("file list note:", e);
+            }
             deleteFileSelect.innerHTML = '';
-            if (counts.size === 0) {
+            if (entries.length === 0) {
                 deleteFileSelect.innerHTML = '<option value="">（取り込み済みのファイルはありません）</option>';
                 deleteFileBtn.disabled = true;
                 return;
             }
             deleteFileSelect.insertAdjacentHTML('beforeend', '<option value="">削除するファイルを選択…</option>');
-            Array.from(counts.keys()).sort((a, b) => a.localeCompare(b, 'ja')).forEach(k => {
+            entries.sort((a, b) => a.key.localeCompare(b.key, 'ja')).forEach(en => {
                 const opt = document.createElement('option');
-                opt.value = k;
-                opt.textContent = `${k}（${counts.get(k)}件）`;
+                opt.value = en.key;
+                opt.textContent = `${en.key}（${en.count}件）`;
                 deleteFileSelect.appendChild(opt);
             });
-            if (counts.has(prev)) deleteFileSelect.value = prev;
+            if (entries.some(en => en.key === prev)) deleteFileSelect.value = prev;
             deleteFileBtn.disabled = !deleteFileSelect.value;
         }
         deleteFileSelect.addEventListener('change', () => { deleteFileBtn.disabled = !deleteFileSelect.value; });
 
         deleteFileBtn.addEventListener('click', async () => {
-            if (!auth.currentUser || auth.currentUser.email !== ADMIN_EMAIL) {
-                alert("削除する権限がありません。管理者としてログインしてください。");
-                return;
-            }
+            if (!isAdminNow()) { alert("削除する権限がありません。管理者としてログインしてください。"); return; }
             const key = deleteFileSelect.value;
             if (!key) return;
-            const ids = appDatabase.filter(r => getSourceFile(r) === key).map(r => r.id);
-            if (ids.length === 0) return;
-            if (!confirm(`「${key}」から取り込んだデータ ${ids.length} 件を削除します。\nこの操作は元に戻せません。よろしいですか？`)) return;
+            if (!confirm(`「${key}」から取り込んだデータを削除します。\nこの操作は元に戻せません。よろしいですか？`)) return;
 
             deleteFileBtn.disabled = true;
-            const showStatus = (text, cls) => {
-                importStatus.textContent = text;
-                importStatus.classList.remove('hidden', 'text-amber-800', 'text-red-600', 'text-emerald-700');
-                importStatus.classList.add(cls);
-            };
-            showStatus("削除しています...", 'text-amber-800');
+            showImportStatus("削除しています...", 'text-amber-800');
             try {
+                let deleted = 0;
                 if (isCloudConnected) {
-                    for (let i = 0; i < ids.length; i += 400) {
+                    const snap = await getDocs(fsQuery(recordsColRef, where('sourceFile', '==', key)));
+                    const refs = snap.docs.map(d => d.ref);
+                    for (let i = 0; i < refs.length; i += 400) {
                         const batch = writeBatch(db);
-                        ids.slice(i, i + 400).forEach(id => batch.delete(doc(recordsColRef, id)));
+                        refs.slice(i, i + 400).forEach(r => batch.delete(r));
                         await batch.commit();
                     }
+                    deleted = refs.length;
+                    await deleteDoc(doc(settingsColRef, fileRegId(key)));
+                } else {
+                    const before = appDatabase.length;
+                    appDatabase = appDatabase.filter(r => getSourceFile(r) !== key);
+                    deleted = before - appDatabase.length;
                 }
-                const idSet = new Set(ids);
-                appDatabase = appDatabase.filter(r => !idSet.has(r.id));
-                document.getElementById('recordCountBadge').textContent = `保存数: ${appDatabase.length}件`;
+                lastFiltered = null;
+                refreshRecordCount();
                 refreshFileList();
                 if (lastSearchQuery || lastIsShowAll) performSearch(lastIsShowAll);
-                showStatus(`「${key}」のデータ ${ids.length} 件を削除しました。`, 'text-red-600');
+                showImportStatus(`「${key}」のデータ ${deleted} 件を削除しました。`, 'text-red-600');
             } catch (err) {
                 console.error("File delete error:", err);
                 const reason = err && err.code === 'permission-denied' ? "Firestoreの削除権限がありません（セキュリティルールを確認してください）" : (err && err.message) || String(err);
-                showStatus(`削除に失敗しました：${reason}`, 'text-red-600');
+                showImportStatus(`削除に失敗しました：${reason}`, 'text-red-600');
                 deleteFileBtn.disabled = !deleteFileSelect.value;
+            }
+        });
+
+        // 既存データ（検索用キーなし）を、高速検索できる形式に一括変換する
+        migrateBtn.addEventListener('click', async () => {
+            if (!isAdminNow() || !isCloudConnected) { alert("管理者としてログインしてください。"); return; }
+            if (!confirm("既存のデータを高速検索用の形式に変換します（初回のみ・数分かかる場合があります）。実行しますか？")) return;
+            migrateBtn.disabled = true;
+            try {
+                showImportStatus("既存データを読み込んでいます...", 'text-amber-800');
+                const snap = await getDocs(recordsColRef);
+                const total = snap.size;
+                const reg = new Map();
+                let batch = writeBatch(db), pending = 0, updated = 0, seen = 0;
+                for (const d of snap.docs) {
+                    const data = d.data();
+                    const src = getSourceFile({ id: d.id, ...data });
+                    const r = reg.get(src) || { count: 0, tournamentName: data.tournamentName || '', date: data.date || '' };
+                    r.count++;
+                    reg.set(src, r);
+                    if (!Array.isArray(data.searchKeys) || typeof data.eventKey !== 'number' || !data.sourceFile) {
+                        batch.update(d.ref, { searchKeys: buildSearchKeys(data), eventKey: getEventKey(data), sourceFile: src });
+                        pending++; updated++;
+                        if (pending >= 400) {
+                            await batch.commit();
+                            batch = writeBatch(db); pending = 0;
+                            showImportStatus(`変換中... ${seen + 1} / ${total} 件`, 'text-amber-800');
+                        }
+                    }
+                    seen++;
+                }
+                if (pending > 0) await batch.commit();
+
+                // 取り込み済みファイルの一覧を作り直す
+                const regEntries = Array.from(reg.entries());
+                for (let i = 0; i < regEntries.length; i += 400) {
+                    const rb = writeBatch(db);
+                    regEntries.slice(i, i + 400).forEach(([key, v]) => {
+                        rb.set(doc(settingsColRef, fileRegId(key)), {
+                            kind: 'file', sourceFile: key, count: v.count,
+                            tournamentName: v.tournamentName, date: v.date, updatedAt: new Date().toISOString()
+                        });
+                    });
+                    await rb.commit();
+                }
+                showImportStatus(`変換が完了しました（全${total}件中、${updated}件を更新）。`, 'text-emerald-700');
+                refreshRecordCount();
+                refreshFileList();
+            } catch (err) {
+                console.error("Migration error:", err);
+                showImportStatus(`変換に失敗しました：${(err && err.message) || err}`, 'text-red-600');
+            } finally {
+                migrateBtn.disabled = false;
             }
         });
 
         // Event Listeners Setup
         searchButton.addEventListener('click', () => performSearch(false));
         sortOrder.addEventListener('change', () => {
-            if (lastSearchQuery || lastIsShowAll) performSearch(lastIsShowAll);
+            if (lastIsShowAll) performSearch(true);
+            else if (lastFiltered && lastFiltered.length) renderResults(sortResults(lastFiltered));
         });
         showAllBtn.addEventListener('click', () => performSearch(true));
         
