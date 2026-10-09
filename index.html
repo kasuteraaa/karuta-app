@@ -188,6 +188,7 @@
                     <span class="text-[10px] bg-amber-200 text-amber-900 px-2 py-0.5 rounded font-bold">管理者限定</span>
                 </div>
                 <p class="text-xs text-amber-900/80 mb-3">取り込んだデータはクラウドに自動保存され、一般ユーザーの検索画面に即時反映されます。</p>
+                <button id="openUsageBtn" class="mb-3 bg-stone-800 hover:bg-stone-900 text-white px-3 py-1.5 rounded-md text-xs font-bold">📊 Firebase利用状況（読み取り・書き込み）を見る</button>
                 <div class="flex flex-wrap items-center gap-1.5 mb-1 text-xs text-amber-950">
                     <span class="font-bold">開催年月:</span>
                     <select id="importYear" class="rounded-md border border-amber-300 p-1 text-xs bg-white font-medium"></select>
@@ -255,9 +256,7 @@
                             </svg>
                             スマホで開く
                         </button>
-                        <button id="showAllBtn" class="text-xs bg-stone-200 hover:bg-stone-300 text-stone-800 py-1.5 px-3 rounded-md font-bold transition">
-                            登録データ一覧を表示
-                        </button>
+
                     </div>
                 </div>
             </div>
@@ -291,6 +290,49 @@
                 <div id="resultsContainer" class="space-y-3"></div>
             </div>
         </main>
+    </div>
+
+    <!-- 利用状況ページ（管理者専用） -->
+    <div id="usageModal" class="hidden" style="position:fixed;inset:0;z-index:55;background:#f4efe6;overflow-y:auto;">
+        <div class="max-w-4xl mx-auto p-4 pb-16">
+            <div class="flex items-center justify-between gap-2 mb-3">
+                <h2 class="text-lg font-bold text-amber-950 font-karuta">📊 Firebase 利用状況</h2>
+                <button id="closeUsageBtn" class="bg-stone-700 hover:bg-stone-800 text-white px-3 py-1.5 rounded-md text-xs font-bold">✕ 閉じる</button>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 mb-3 text-xs">
+                <select id="usageRange" class="rounded-md border border-stone-300 p-1.5 bg-white font-medium">
+                    <option value="1">直近24時間</option>
+                    <option value="3">直近3日</option>
+                    <option value="7">直近7日</option>
+                </select>
+                <button id="refreshUsageBtn" class="bg-white border border-stone-300 hover:bg-stone-50 px-3 py-1.5 rounded-md font-bold">🔄 今すぐ更新</button>
+                <span id="usageUpdated" class="text-stone-500"></span>
+            </div>
+            <div id="usageAlerts"></div>
+            <div id="usageSummary" class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4"></div>
+            <div class="bg-white rounded-xl shadow p-3 mb-4">
+                <h3 class="text-sm font-bold text-stone-700 mb-1">読み取り数（30分ごと）</h3>
+                <div id="chartReads"></div>
+            </div>
+            <div class="bg-white rounded-xl shadow p-3 mb-4">
+                <h3 class="text-sm font-bold text-stone-700 mb-1">書き込み数・削除数（30分ごと）</h3>
+                <div id="chartWrites"></div>
+            </div>
+            <div class="bg-white rounded-xl shadow p-3 mb-4">
+                <h3 class="text-sm font-bold text-stone-700 mb-2">日別の合計と無料枠に対する割合</h3>
+                <div id="usageDaily"></div>
+            </div>
+            <div class="text-[11px] text-stone-500 leading-relaxed bg-white/60 rounded-lg p-3">
+                <p class="font-bold mb-1">この画面の数字について</p>
+                <ul class="list-disc pl-4 space-y-0.5">
+                    <li>このサイトの操作（検索・取り込み・削除など）から発生した読み取り・書き込み・削除を、サイト自身が数えた<strong>目安の数字</strong>です。公式の数字ではありません。</li>
+                    <li>正確な数字は、Firebaseコンソールの「Firestore Database」→「使用状況」タブで確認できます。</li>
+                    <li>無料枠（Sparkプラン）は、1日あたり 読み取り5万・書き込み2万・削除2万です。毎日、太平洋時間の0時（日本時間の16〜17時ごろ）にリセットされます。</li>
+                    <li>一般の利用者の分も記録するには、Firestoreのセキュリティルールの更新が必要です（案内済みの手順）。更新するまでは、管理者の操作分だけが記録されます。</li>
+                    <li>記録は2分ごとにまとめて送られ、この記録自体の書き込みも数に含まれています。</li>
+                </ul>
+            </div>
+        </div>
     </div>
 
     <!-- Now Loading Overlay (クラウドからの初回読み込み中に表示) -->
@@ -452,7 +494,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, getDoc, onSnapshot, writeBatch, query as fsQuery, where, limit, orderBy, getCountFromServer } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, getDoc, onSnapshot, writeBatch, query as fsQuery, where, limit, orderBy, getCountFromServer, increment } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Global Firebase Configuration Setup
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'karuta-tournament-app';
@@ -486,7 +528,6 @@
         }
         setTimeout(hideBootLoading, 30000); // 万一の保険：30秒で必ず消す
         let lastSearchQuery = "";
-        let lastIsShowAll = false;
         let currentPasscode = "karuta2026"; 
         let isPasscodeVerified = false;
         let passcodeLoaded = false;   // Firestoreから合言葉を読み込み済みか
@@ -496,7 +537,6 @@
         const settingsDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'app_settings', 'config');
         const settingsColRef = collection(db, 'artifacts', appId, 'public', 'data', 'app_settings');
         const SEARCH_LIMIT = 500;     // 1回の検索で取得する最大件数
-        const SHOW_ALL_LIMIT = 300;   // 一覧表示で取得する最大件数
         let lastFiltered = null;      // 直前の検索結果（並び順の切り替え用）
         let searchSeq = 0;
 
@@ -518,6 +558,49 @@
         }
         const fileRegId = (key) => 'file__' + String(key).replace(/[\/\\\s.#\[\]?]+/g, '_');
 
+        // ===== Firebase 利用状況の記録（このサイトからの読み取り・書き込み・削除を30分ごとに集計） =====
+        const USAGE_BUCKET_MS = 30 * 60 * 1000;          // 30分
+        const usagePending = new Map();                   // 未送信の集計 bucket -> {reads, writes, deletes}
+        let usageFlushTimer = null;
+        let usageFailures = 0;
+
+        // type: 'reads' | 'writes' | 'deletes'
+        function trackUsage(type, n) {
+            if (!n || n < 0) return;
+            const b = Math.floor(Date.now() / USAGE_BUCKET_MS);
+            const e = usagePending.get(b) || { reads: 0, writes: 0, deletes: 0 };
+            e[type] += n;
+            usagePending.set(b, e);
+            if (!usageFlushTimer && usageFailures < 3) {
+                usageFlushTimer = setTimeout(() => { usageFlushTimer = null; flushUsage(); }, 120000); // 2分ごとにまとめて送信
+            }
+        }
+        async function flushUsage() {
+            if (!isCloudConnected || !auth.currentUser || usagePending.size === 0) return;
+            const entries = Array.from(usagePending.entries());
+            usagePending.clear();
+            for (const [b, e] of entries) {
+                try {
+                    await setDoc(doc(settingsColRef, 'usage__' + b), {
+                        kind: 'usage',
+                        t: b * USAGE_BUCKET_MS,
+                        reads: increment(e.reads),
+                        writes: increment(e.writes + 1),   // +1 は、この記録自体の書き込み
+                        deletes: increment(e.deletes)
+                    }, { merge: true });
+                    usageFailures = 0;
+                } catch (err) {
+                    usageFailures++;
+                    console.log("usage log note:", err);
+                }
+            }
+        }
+        // 画面を閉じる・隠すときにも送信を試みる
+        document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushUsage(); });
+        window.addEventListener('pagehide', () => { flushUsage(); });
+
+
+
         // 保存件数（集計のみを取得するので軽い）
         async function refreshRecordCount() {
             let total = null;
@@ -525,6 +608,7 @@
                 if (isCloudConnected) {
                     const snap = await getCountFromServer(recordsColRef);
                     total = snap.data().count;
+                    trackUsage('reads', Math.max(1, Math.ceil(total / 1000)));
                 } else {
                     total = appDatabase.length;
                 }
@@ -568,6 +652,7 @@
 
                 // Sync Passcode Settings
                 onSnapshot(settingsDocRef, (docSnap) => {
+                    trackUsage('reads', 1);
                     if (docSnap.exists()) {
                         const data = docSnap.data();
                         if (data.passCode) {
@@ -576,6 +661,7 @@
                         }
                     } else if (auth.currentUser && auth.currentUser.email === ADMIN_EMAIL) {
                         // 初期の合言葉を管理者のときだけ登録
+                        trackUsage('writes', 1);
                         setDoc(settingsDocRef, {
                             passCode: currentPasscode,
                             adminEmail: ADMIN_EMAIL,
@@ -720,6 +806,7 @@
                     adminEmail: ADMIN_EMAIL,
                     updatedAt: new Date().toISOString()
                 });
+                trackUsage('writes', 1);
                 msg.classList.remove('hidden');
                 setTimeout(() => msg.classList.add('hidden'), 3000);
             } catch (err) {
@@ -1238,6 +1325,7 @@ excelFileInput.addEventListener('change', async function(e) {
                                 batch.set(doc(recordsColRef, _docId), payload);
                             });
                             await batch.commit();
+                            trackUsage('writes', Math.min(400, records.length - i));
                         }
                         // 取り込み済みファイルの一覧（削除用）に登録
                         await setDoc(doc(settingsColRef, fileRegId(records[0].sourceFile)), {
@@ -1248,6 +1336,7 @@ excelFileInput.addEventListener('change', async function(e) {
                             date: records[0].date,
                             updatedAt: new Date().toISOString()
                         });
+                        trackUsage('writes', 1);
                     } else {
                         records.forEach(rec => {
                             const { _docId, ...payload } = rec;
@@ -1281,7 +1370,7 @@ excelFileInput.addEventListener('change', async function(e) {
             if (totalAdded > 0) {
                 refreshRecordCount();
                 refreshFileList();
-                if (lastSearchQuery || lastIsShowAll) performSearch(lastIsShowAll);
+                if (lastSearchQuery) performSearch();
             }
         });
 
@@ -1295,7 +1384,6 @@ excelFileInput.addEventListener('change', async function(e) {
         const emptyMessage = document.getElementById('emptyMessage');
         const resultsHeader = document.getElementById('resultsHeader');
         const resultCount = document.getElementById('resultCount');
-        const showAllBtn = document.getElementById('showAllBtn');
 
         const sortOrder = document.getElementById('sortOrder');
 
@@ -1321,31 +1409,29 @@ excelFileInput.addEventListener('change', async function(e) {
             });
         }
 
-        async function performSearch(showAll = false) {
-            lastIsShowAll = showAll;
+        async function performSearch() {
             const rawQuery = searchInput.value.trim();
             lastSearchQuery = rawQuery;
             const q = normForSearch(rawQuery);
             const filterValue = classFilter.value;
 
-            if (!q && !showAll) return;
+            if (!q) return;
 
             const seq = ++searchSeq;
             initialMessage.classList.add('hidden');
             resultsContainer.innerHTML = '';
             emptyMessage.classList.add('hidden');
             loadingIndicator.classList.remove('hidden');
-            resultsHeader.querySelector('span').textContent = showAll ? `登録データ一覧（${sortOrder.value === 'asc' ? '古い' : '新しい'}順に最大${SHOW_ALL_LIMIT}件）` : `「${rawQuery}」の検索結果`;
+            resultsHeader.querySelector('span').textContent = `「${rawQuery}」の検索結果`;
 
             let candidates = [];
             let truncated = false;
             try {
                 if (isCloudConnected) {
-                    const maxCount = showAll ? SHOW_ALL_LIMIT : SEARCH_LIMIT;
-                    const qr = showAll
-                        ? fsQuery(recordsColRef, orderBy('eventKey', sortOrder.value === 'asc' ? 'asc' : 'desc'), limit(maxCount))
-                        : fsQuery(recordsColRef, where('searchKeys', 'array-contains', q.slice(0, SEARCH_KEY_LEN)), limit(maxCount));
+                    const maxCount = SEARCH_LIMIT;
+                    const qr = fsQuery(recordsColRef, where('searchKeys', 'array-contains', q.slice(0, SEARCH_KEY_LEN)), limit(maxCount));
                     const snap = await getDocs(qr);
+                    trackUsage('reads', Math.max(1, snap.size));
                     candidates = snap.docs.map(d => ({ id: d.id, ...d.data() }));
                     truncated = snap.size >= maxCount;
                 } else {
@@ -1362,7 +1448,7 @@ excelFileInput.addEventListener('change', async function(e) {
             if (seq !== searchSeq) return; // 新しい検索が始まっていたら捨てる
 
             const results = candidates.filter(record => {
-                const matchQuery = showAll ||
+                const matchQuery =
                     normForSearch(record.playerName).includes(q) ||
                     normForSearch(record.society).includes(q) ||
                     normForSearch(record.tournamentName).includes(q);
@@ -1485,19 +1571,23 @@ excelFileInput.addEventListener('change', async function(e) {
             try {
                 if (!auth.currentUser || auth.currentUser.email !== ADMIN_EMAIL) throw new Error("管理者権限がありません");
                 const snapshot = await getDocs(recordsColRef);
+                trackUsage('reads', Math.max(1, snapshot.size));
                 const refs = snapshot.docs.map(d => d.ref);
                 for (let i = 0; i < refs.length; i += 400) {
                     const batch = writeBatch(db);
                     refs.slice(i, i + 400).forEach(r => batch.delete(r));
                     await batch.commit();
+                    trackUsage('deletes', Math.min(400, refs.length - i));
                 }
                 // 取り込み済みファイルの一覧も消す
-                const regSnap = await getDocs(settingsColRef);
+                const regSnap = await getDocs(fsQuery(settingsColRef, where('kind', '==', 'file')));
+                trackUsage('reads', Math.max(1, regSnap.size));
                 const regRefs = regSnap.docs.filter(d => d.data().kind === 'file').map(d => d.ref);
                 if (regRefs.length) {
                     const batch = writeBatch(db);
                     regRefs.forEach(r => batch.delete(r));
                     await batch.commit();
+                    trackUsage('deletes', regRefs.length);
                 }
 
                 appDatabase = [];
@@ -1597,7 +1687,8 @@ excelFileInput.addEventListener('change', async function(e) {
             try {
                 if (isCloudConnected) {
                     if (!isAdminNow()) return;
-                    const snap = await getDocs(settingsColRef);
+                    const snap = await getDocs(fsQuery(settingsColRef, where('kind', '==', 'file')));
+                    trackUsage('reads', Math.max(1, snap.size));
                     snap.forEach(d => {
                         const x = d.data();
                         if (x.kind === 'file') entries.push({ key: x.sourceFile, count: x.count, tournamentName: x.tournamentName, date: x.date });
@@ -1637,14 +1728,17 @@ excelFileInput.addEventListener('change', async function(e) {
                 try {
                     if (isCloudConnected) {
                         const snap = await getDocs(fsQuery(recordsColRef, where('sourceFile', '==', key)));
+                        trackUsage('reads', Math.max(1, snap.size));
                         const refs = snap.docs.map(d => d.ref);
                         for (let i = 0; i < refs.length; i += 400) {
                             const batch = writeBatch(db);
                             refs.slice(i, i + 400).forEach(r => batch.delete(r));
                             await batch.commit();
+                            trackUsage('deletes', Math.min(400, refs.length - i));
                         }
                         totalDeleted += refs.length;
                         await deleteDoc(doc(settingsColRef, fileRegId(key)));
+                        trackUsage('deletes', 1);
                     } else {
                         const before = appDatabase.length;
                         appDatabase = appDatabase.filter(r => getSourceFile(r) !== key);
@@ -1660,7 +1754,7 @@ excelFileInput.addEventListener('change', async function(e) {
             lastFiltered = null;
             await refreshFileList();
             refreshRecordCount();
-            if (lastSearchQuery || lastIsShowAll) performSearch(lastIsShowAll);
+            if (lastSearchQuery) performSearch();
             if (failed.length === 0) {
                 showImportStatus(`${keys.length}個のファイル（${totalDeleted}件）を削除しました。`, 'text-red-600');
             } else {
@@ -1676,6 +1770,7 @@ excelFileInput.addEventListener('change', async function(e) {
             try {
                 showImportStatus("既存データを読み込んでいます...", 'text-amber-800');
                 const snap = await getDocs(recordsColRef);
+                trackUsage('reads', Math.max(1, snap.size));
                 const total = snap.size;
                 const reg = new Map();
                 let batch = writeBatch(db), pending = 0, updated = 0, seen = 0;
@@ -1690,13 +1785,14 @@ excelFileInput.addEventListener('change', async function(e) {
                         pending++; updated++;
                         if (pending >= 400) {
                             await batch.commit();
+                            trackUsage('writes', pending);
                             batch = writeBatch(db); pending = 0;
                             showImportStatus(`変換中... ${seen + 1} / ${total} 件`, 'text-amber-800');
                         }
                     }
                     seen++;
                 }
-                if (pending > 0) await batch.commit();
+                if (pending > 0) { await batch.commit(); trackUsage('writes', pending); }
 
                 // 取り込み済みファイルの一覧を作り直す
                 const regEntries = Array.from(reg.entries());
@@ -1709,6 +1805,7 @@ excelFileInput.addEventListener('change', async function(e) {
                         });
                     });
                     await rb.commit();
+                    trackUsage('writes', Math.min(400, regEntries.length - i));
                 }
                 showImportStatus(`変換が完了しました（全${total}件中、${updated}件を更新）。`, 'text-emerald-700');
                 refreshRecordCount();
@@ -1721,17 +1818,204 @@ excelFileInput.addEventListener('change', async function(e) {
             }
         });
 
+        // ===== 利用状況ページ（管理者専用） =====
+        const FREE_QUOTA = { reads: 50000, writes: 20000, deletes: 20000 };   // 無料枠（1日あたり）
+        const usageModal = document.getElementById('usageModal');
+        const usageRange = document.getElementById('usageRange');
+        let usageData = new Map();     // bucket -> {reads, writes, deletes}
+        let usageAutoTimer = null;
+        const fmtNum = (n) => Number(n || 0).toLocaleString('ja-JP');
+        const pad2 = (n) => String(n).padStart(2, '0');
+        const ptDayKey = (ms) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+
+        function niceMax(v) {
+            if (v <= 0) return 10;
+            const p = Math.pow(10, Math.floor(Math.log10(v)));
+            return [1, 2, 5, 10].map(k => k * p).find(x => x >= v);
+        }
+        function barColorByPct(pct) { return pct >= 80 ? '#dc2626' : pct >= 50 ? '#d97706' : '#059669'; }
+
+        function renderBarChart(el, startB, endB, series, days) {
+            const n = endB - startB + 1;
+            const W = 800, H = 210, ml = 48, mr = 6, mt = 8, mb = 24;
+            const pw = W - ml - mr, ph = H - mt - mb, bw = pw / n;
+            let maxV = 0;
+            for (let i = 0; i < n; i++) {
+                const e = usageData.get(startB + i) || {};
+                const sum = series.reduce((a, s) => a + (e[s.key] || 0), 0);
+                if (sum > maxV) maxV = sum;
+            }
+            const top = niceMax(maxV);
+            let svg = `<svg viewBox="0 0 ${W} ${H}" class="w-full h-auto" role="img">`;
+            for (let g = 0; g <= 4; g++) {
+                const y = mt + ph - ph * g / 4;
+                svg += `<line x1="${ml}" x2="${W - mr}" y1="${y}" y2="${y}" stroke="#e7e0d3" stroke-width="1"/>` +
+                       `<text x="${ml - 4}" y="${y + 3}" text-anchor="end" font-size="9" fill="#78716c">${fmtNum(Math.round(top * g / 4))}</text>`;
+            }
+            for (let i = 0; i < n; i++) {
+                const b = startB + i;
+                const e = usageData.get(b) || {};
+                const d = new Date(b * USAGE_BUCKET_MS);
+                const x = ml + i * bw;
+                const label = `${d.getMonth() + 1}/${d.getDate()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}〜（30分間）`;
+                let yBase = mt + ph;
+                series.forEach(s => {
+                    const v = e[s.key] || 0;
+                    if (!v) return;
+                    const h = Math.max(ph * v / top, 1);
+                    yBase -= h;
+                    svg += `<rect x="${x + bw * 0.1}" y="${yBase}" width="${Math.max(bw * 0.8, 0.8)}" height="${h}" fill="${s.color}"><title>${label}\n${s.label}: ${fmtNum(v)}</title></rect>`;
+                });
+                const showTick = days <= 1 ? (d.getMinutes() === 0 && d.getHours() % 3 === 0) : (d.getMinutes() === 0 && d.getHours() === 0);
+                if (showTick) {
+                    const txt = days <= 1 ? `${pad2(d.getHours())}:00` : `${d.getMonth() + 1}/${d.getDate()}`;
+                    svg += `<text x="${x + bw / 2}" y="${H - 8}" text-anchor="middle" font-size="9" fill="#78716c">${txt}</text>`;
+                }
+            }
+            svg += '</svg>';
+            const legend = series.map(s => `<span class="inline-flex items-center gap-1 mr-3"><i style="display:inline-block;width:10px;height:10px;background:${s.color};border-radius:2px"></i>${s.label}</span>`).join('');
+            el.innerHTML = `<div class="text-[11px] text-stone-600 mb-1">${legend}（棒にカーソルを合わせると数値が見られます）</div>` + svg;
+        }
+
+        async function loadUsage() {
+            if (!isAdminNow()) return;
+            const updatedEl = document.getElementById('usageUpdated');
+            updatedEl.textContent = '読み込み中...';
+            try {
+                await flushUsage();
+                const days = parseInt(usageRange.value, 10) || 1;
+                const fetchDays = Math.max(days, 2);
+                const nowB = Math.floor(Date.now() / USAGE_BUCKET_MS);
+                const startFetchB = nowB - fetchDays * 48;
+                const snap = await getDocs(fsQuery(settingsColRef, where('t', '>=', startFetchB * USAGE_BUCKET_MS)));
+                trackUsage('reads', Math.max(1, snap.size));
+                usageData = new Map();
+                snap.forEach(d => {
+                    const x = d.data();
+                    if (x.kind !== 'usage') return;
+                    usageData.set(Math.round(x.t / USAGE_BUCKET_MS), { reads: x.reads || 0, writes: x.writes || 0, deletes: x.deletes || 0 });
+                });
+                // まだ送信していない分も合算して表示
+                usagePending.forEach((e, b) => {
+                    const cur = usageData.get(b) || { reads: 0, writes: 0, deletes: 0 };
+                    usageData.set(b, { reads: cur.reads + e.reads, writes: cur.writes + e.writes, deletes: cur.deletes + e.deletes });
+                });
+                renderUsage(days, nowB);
+                updatedEl.textContent = `最終更新: ${new Date().toLocaleTimeString('ja-JP')}（30分ごとに自動更新）`;
+            } catch (err) {
+                console.error("usage load error:", err);
+                updatedEl.textContent = '読み込みに失敗しました: ' + ((err && err.message) || err);
+            }
+        }
+
+        function renderUsage(days, nowB) {
+            const startB = nowB - days * 48;
+            const todayKey = ptDayKey(Date.now());
+
+            // 日別合計（太平洋時間の日付ごと：無料枠のリセット基準）
+            const daily = new Map();
+            usageData.forEach((e, b) => {
+                const k = ptDayKey(b * USAGE_BUCKET_MS);
+                const cur = daily.get(k) || { reads: 0, writes: 0, deletes: 0 };
+                cur.reads += e.reads; cur.writes += e.writes; cur.deletes += e.deletes;
+                daily.set(k, cur);
+            });
+            const today = daily.get(todayKey) || { reads: 0, writes: 0, deletes: 0 };
+
+            // サマリーカード
+            const summary = document.getElementById('usageSummary');
+            summary.innerHTML = ['reads', 'writes', 'deletes'].map(key => {
+                const label = { reads: '読み取り', writes: '書き込み', deletes: '削除' }[key];
+                const v = today[key], q = FREE_QUOTA[key];
+                const pct = Math.min(100, v / q * 100);
+                return `<div class="bg-white rounded-xl shadow p-3">
+                    <div class="text-xs text-stone-500">本日の${label}</div>
+                    <div class="text-2xl font-bold text-stone-800">${fmtNum(v)}<span class="text-xs font-normal text-stone-500"> / ${fmtNum(q)}</span></div>
+                    <div class="h-2 bg-stone-200 rounded mt-1.5"><div style="width:${pct}%;background:${barColorByPct(pct)}" class="h-2 rounded"></div></div>
+                    <div class="text-[11px] mt-1" style="color:${barColorByPct(pct)}">無料枠の ${pct.toFixed(1)}% を使用</div>
+                </div>`;
+            }).join('');
+
+            // 注意・異常
+            const alerts = [];
+            ['reads', 'writes', 'deletes'].forEach(key => {
+                const label = { reads: '読み取り', writes: '書き込み', deletes: '削除' }[key];
+                const pct = today[key] / FREE_QUOTA[key] * 100;
+                if (pct >= 80) alerts.push({ level: 'red', text: `本日の${label}が無料枠の${pct.toFixed(0)}%に達しています。上限を超えると、その日は${label}ができなくなる可能性があります。` });
+                else if (pct >= 50) alerts.push({ level: 'amber', text: `本日の${label}が無料枠の${pct.toFixed(0)}%を超えました。` });
+            });
+            const abs = { reads: 5000, writes: 2000, deletes: 2000 };
+            ['reads', 'writes', 'deletes'].forEach(key => {
+                const label = { reads: '読み取り', writes: '書き込み', deletes: '削除' }[key];
+                const vals = [];
+                for (let b = startB; b <= nowB; b++) { const v = (usageData.get(b) || {})[key] || 0; if (v > 0) vals.push(v); }
+                const sorted = vals.slice().sort((a, b) => a - b);
+                const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
+                const found = [];
+                for (let b = startB; b <= nowB; b++) {
+                    const v = (usageData.get(b) || {})[key] || 0;
+                    if (v >= abs[key] || (median > 0 && v >= median * 5 && v >= 1000)) found.push({ b, v });
+                }
+                found.sort((a, b) => b.v - a.v).slice(0, 3).forEach(({ b, v }) => {
+                    const d = new Date(b * USAGE_BUCKET_MS);
+                    alerts.push({ level: 'amber', text: `${d.getMonth() + 1}/${d.getDate()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}〜の30分間に${label}が ${fmtNum(v)} 件と多めです（取り込み・変換・全消去の作業中は多くなります。心当たりがない場合は要注意）。` });
+                });
+            });
+            const alertEl = document.getElementById('usageAlerts');
+            if (usageData.size === 0) {
+                alertEl.innerHTML = `<div class="bg-stone-50 border border-stone-300 text-stone-700 text-xs rounded-lg p-3 mb-3">まだ記録がありません。サイトが使われると、約2分後から記録が始まります。</div>`;
+            } else if (alerts.length === 0) {
+                alertEl.innerHTML = `<div class="bg-emerald-50 border border-emerald-300 text-emerald-800 text-xs rounded-lg p-3 mb-3">✅ 今のところ異常は見つかっていません。</div>`;
+            } else {
+                alertEl.innerHTML = alerts.map(a => a.level === 'red'
+                    ? `<div class="bg-red-50 border border-red-300 text-red-800 text-xs rounded-lg p-3 mb-2">🚨 ${a.text}</div>`
+                    : `<div class="bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded-lg p-3 mb-2">⚠️ ${a.text}</div>`).join('');
+            }
+
+            // グラフ（30分ごと）
+            renderBarChart(document.getElementById('chartReads'), startB, nowB, [{ key: 'reads', label: '読み取り', color: '#0284c7' }], days);
+            renderBarChart(document.getElementById('chartWrites'), startB, nowB, [
+                { key: 'writes', label: '書き込み', color: '#d97706' },
+                { key: 'deletes', label: '削除', color: '#dc2626' }
+            ], days);
+
+            // 日別合計
+            const dayRows = Array.from(daily.entries()).sort((a, b) => b[0].localeCompare(a[0]));
+            const bar = (v, q) => {
+                const pct = Math.min(100, v / q * 100);
+                return `<div class="flex-1 min-w-0"><div class="h-2 bg-stone-200 rounded"><div style="width:${pct}%;background:${barColorByPct(pct)}" class="h-2 rounded"></div></div><div class="text-[10px] text-stone-500 mt-0.5">${fmtNum(v)} / ${fmtNum(q)}</div></div>`;
+            };
+            document.getElementById('usageDaily').innerHTML =
+                `<div class="flex gap-2 text-[11px] font-bold text-stone-600 mb-1"><div class="w-20">日付(太平洋時間)</div><div class="flex-1">読み取り</div><div class="flex-1">書き込み</div><div class="flex-1">削除</div></div>` +
+                dayRows.map(([k, v]) => `<div class="flex gap-2 items-start py-1 border-t border-stone-100"><div class="w-20 text-xs text-stone-700">${k}${k === todayKey ? '<br><span class="text-[10px] text-emerald-700">（本日）</span>' : ''}</div>${bar(v.reads, FREE_QUOTA.reads)}${bar(v.writes, FREE_QUOTA.writes)}${bar(v.deletes, FREE_QUOTA.deletes)}</div>`).join('');
+        }
+
+        function openUsagePage() {
+            if (!isAdminNow()) { alert("管理者としてログインしてください。"); return; }
+            usageModal.classList.remove('hidden');
+            loadUsage();
+            clearInterval(usageAutoTimer);
+            usageAutoTimer = setInterval(loadUsage, 30 * 60 * 1000);   // 30分ごとに自動更新
+        }
+        function closeUsagePage() {
+            usageModal.classList.add('hidden');
+            clearInterval(usageAutoTimer);
+            usageAutoTimer = null;
+        }
+        document.getElementById('openUsageBtn').addEventListener('click', openUsagePage);
+        document.getElementById('closeUsageBtn').addEventListener('click', closeUsagePage);
+        document.getElementById('refreshUsageBtn').addEventListener('click', loadUsage);
+        usageRange.addEventListener('change', loadUsage);
+
         // Event Listeners Setup
-        searchButton.addEventListener('click', () => performSearch(false));
+        searchButton.addEventListener('click', () => performSearch());
         sortOrder.addEventListener('change', () => {
-            if (lastIsShowAll) performSearch(true);
-            else if (lastFiltered && lastFiltered.length) renderResults(sortResults(lastFiltered));
+            if (lastFiltered && lastFiltered.length) renderResults(sortResults(lastFiltered));
         });
-        showAllBtn.addEventListener('click', () => performSearch(true));
         
         searchInput.addEventListener('keypress', function (e) {
             if (e.key === 'Enter') {
-                performSearch(false);
+                performSearch();
             }
         });
 
