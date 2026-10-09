@@ -532,7 +532,14 @@
                 console.log("count note:", e);
             }
             document.getElementById('recordCountBadge').textContent = total === null ? '保存数: -' : `保存数: ${total}件`;
-            document.getElementById('clearDataBtn').classList.toggle('hidden', !(total > 0));
+            lastTotalCount = total;
+            updateClearBtnVisibility();
+        }
+        // 全消去ボタンは「管理者」かつ「データがある」ときだけ表示
+        let lastTotalCount = 0;
+        function updateClearBtnVisibility() {
+            const isAdmin = !!(auth.currentUser && auth.currentUser.email === ADMIN_EMAIL);
+            document.getElementById('clearDataBtn').classList.toggle('hidden', !(isAdmin && lastTotalCount > 0));
         }
 
         // 閲覧認証：入力した合言葉をタブ内に保存し、現在の合言葉と一致する間だけ有効
@@ -580,6 +587,7 @@
                 }, (err) => {
                     console.log("Settings sync note:", err);
                     passcodeLoaded = true;
+                    updateClearBtnVisibility();
                     checkAccessState();
                 });
 
@@ -836,6 +844,8 @@ excelFileInput.addEventListener('change', async function(e) {
             // 級の判定：「A級」「Ａ級」「E1級」「D3級」「C級」「C1」など、A〜Eのアルファベットを探す（数字は無視）
             const detectClass = (text) => {
                 const t = toHalf(text).toUpperCase();
+                // 名人位・クイーン位（挑戦者決定予選）は出場者がA級のみ → A級として扱う
+                if (/名人|クイーン/.test(t)) return "A";
                 let m = t.match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\s*\d*\s*級/);
                 if (!m) m = t.match(/級\s*([A-E])(?![A-Z])/);
                 if (!m) m = t.match(/(?:^|[^A-Z])([A-E])\s*[-_－ー]?\s*\d*\s*(?:$|[^A-Z])/);
