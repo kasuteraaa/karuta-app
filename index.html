@@ -288,6 +288,10 @@
                 </div>
 
                 <div id="resultsContainer" class="space-y-3"></div>
+
+                <div id="loadMoreWrap" class="hidden text-center mt-4">
+                    <button id="loadMoreBtn" type="button" class="bg-amber-800 hover:bg-amber-900 disabled:opacity-50 text-white px-6 py-2 rounded-md text-sm font-bold shadow">もっと見る</button>
+                </div>
             </div>
         </main>
     </div>
@@ -494,7 +498,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, getDoc, onSnapshot, writeBatch, query as fsQuery, where, limit, orderBy, getCountFromServer, increment } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, setDoc, getDoc, onSnapshot, writeBatch, query as fsQuery, where, limit, startAfter, orderBy, getCountFromServer, increment, deleteField } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Global Firebase Configuration Setup
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'karuta-tournament-app';
@@ -536,7 +540,11 @@
         const recordsColRef = collection(db, 'artifacts', appId, 'public', 'data', 'tournament_records');
         const settingsDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'app_settings', 'config');
         const settingsColRef = collection(db, 'artifacts', appId, 'public', 'data', 'app_settings');
-        const SEARCH_LIMIT = 500;     // 1回の検索で取得する最大件数
+        // 取り込み済みファイルの一覧を1つのドキュメントにまとめて保存（一覧の表示が1回の読み取りで済む）
+        const fileIndexDocRef = doc(settingsColRef, 'file_index');
+        let fileIndexReady = false;   // 一覧ドキュメントを読み込み（または作成）済みか
+        const SEARCH_PAGE_SIZE = 50;  // 1回に取得する件数（続きは「もっと見る」で取得）
+        let searchState = null;       // 実行中の検索 { q, filterValue, cursor, hasMore, results }
         let lastFiltered = null;      // 直前の検索結果（並び順の切り替え用）
         let searchSeq = 0;
 
@@ -601,23 +609,33 @@
 
 
 
-        // 保存件数（集計のみを取得するので軽い）
-        async function refreshRecordCount() {
-            let total = null;
+        // 保存件数
+        // 件数の集計(getCountFromServer)は「1000件ごとに1読み取り」かかるため、ページを開くたびには行わない。
+        // 管理者がデータを変更したときだけ数え直して設定ドキュメント(config.recordCount)に保存し、
+        // 閲覧者はすでに読み込んでいる設定ドキュメントの値を表示する（追加の読み取りなし）。
+        let cloudRecordCount = null;
+        let countFallbackDone = false;
+        function showRecordCount(total) {
+            document.getElementById('recordCountBadge').textContent = total === null ? '保存数: -' : `保存数: ${total}件`;
+            lastTotalCount = total;
+            updateClearBtnVisibility();
+        }
+        async function refreshRecordCount(recount = false) {
+            if (!isCloudConnected) { showRecordCount(appDatabase.length); return; }
+            if (!recount) { if (cloudRecordCount !== null) showRecordCount(cloudRecordCount); return; }
             try {
-                if (isCloudConnected) {
-                    const snap = await getCountFromServer(recordsColRef);
-                    total = snap.data().count;
-                    trackUsage('reads', Math.max(1, Math.ceil(total / 1000)));
-                } else {
-                    total = appDatabase.length;
+                const snap = await getCountFromServer(recordsColRef);
+                const total = snap.data().count;
+                trackUsage('reads', Math.max(1, Math.ceil(total / 1000)));
+                cloudRecordCount = total;
+                showRecordCount(total);
+                if (isAdminNow()) {
+                    await setDoc(settingsDocRef, { recordCount: total, recordCountAt: new Date().toISOString() }, { merge: true });
+                    trackUsage('writes', 1);
                 }
             } catch (e) {
                 console.log("count note:", e);
             }
-            document.getElementById('recordCountBadge').textContent = total === null ? '保存数: -' : `保存数: ${total}件`;
-            lastTotalCount = total;
-            updateClearBtnVisibility();
         }
         // 全消去ボタンは「管理者」かつ「データがある」ときだけ表示
         let lastTotalCount = 0;
@@ -659,6 +677,10 @@
                             currentPasscode = data.passCode;
                             document.getElementById('newPasscodeInput').value = currentPasscode;
                         }
+                        if (typeof data.recordCount === 'number') {
+                            cloudRecordCount = data.recordCount;
+                            showRecordCount(cloudRecordCount);
+                        }
                     } else if (auth.currentUser && auth.currentUser.email === ADMIN_EMAIL) {
                         // 初期の合言葉を管理者のときだけ登録
                         trackUsage('writes', 1);
@@ -667,6 +689,11 @@
                             adminEmail: ADMIN_EMAIL,
                             updatedAt: new Date().toISOString()
                         }).catch(err => console.log("Settings init note:", err));
+                    }
+                    // 件数がまだ保存されていない（旧データ）ときだけ、1回だけ数える（管理者なら保存もする）
+                    if (cloudRecordCount === null && !countFallbackDone) {
+                        countFallbackDone = true;
+                        refreshRecordCount(true);
                     }
                     passcodeLoaded = true;
                     checkAccessState();
@@ -695,11 +722,12 @@
                         document.getElementById('adminControlPanel').classList.add('hidden');
                         if (importSection) importSection.classList.add('hidden');
                     }
+                    updateClearBtnVisibility();
                     checkAccessState();
                 });
 
                 // 全件は読み込まない（検索のたびに必要な分だけ取得する）
-                refreshRecordCount();
+                // 保存件数は設定ドキュメント(onSnapshot)から表示する
                 hideBootLoading();
 
             } catch (err) {
@@ -1317,6 +1345,7 @@ excelFileInput.addEventListener('change', async function(e) {
                     }
 
                     if (isCloudConnected && auth.currentUser) {
+                        if (!fileIndexReady) await refreshFileList();   // 一覧ドキュメントを先に用意しておく
                         // Firestoreのバッチ書き込み（1回あたり最大500件のため400件ずつ）
                         for (let i = 0; i < records.length; i += 400) {
                             const batch = writeBatch(db);
@@ -1328,14 +1357,18 @@ excelFileInput.addEventListener('change', async function(e) {
                             trackUsage('writes', Math.min(400, records.length - i));
                         }
                         // 取り込み済みファイルの一覧（削除用）に登録
-                        await setDoc(doc(settingsColRef, fileRegId(records[0].sourceFile)), {
-                            kind: 'file',
-                            sourceFile: records[0].sourceFile,
-                            count: records.length,
-                            tournamentName: records[0].tournamentName,
-                            date: records[0].date,
-                            updatedAt: new Date().toISOString()
-                        });
+                        await setDoc(fileIndexDocRef, {
+                            kind: 'file_index',
+                            files: {
+                                [fileRegId(records[0].sourceFile)]: {
+                                    sourceFile: records[0].sourceFile,
+                                    count: records.length,
+                                    tournamentName: records[0].tournamentName,
+                                    date: records[0].date,
+                                    updatedAt: new Date().toISOString()
+                                }
+                            }
+                        }, { merge: true });
                         trackUsage('writes', 1);
                     } else {
                         records.forEach(rec => {
@@ -1368,7 +1401,7 @@ excelFileInput.addEventListener('change', async function(e) {
                 setStatus(`${head}読み込みに失敗したファイルがあります → ${failures.join(" / ")}`, 'error');
             }
             if (totalAdded > 0) {
-                refreshRecordCount();
+                refreshRecordCount(true);
                 refreshFileList();
                 if (lastSearchQuery) performSearch();
             }
@@ -1409,6 +1442,18 @@ excelFileInput.addEventListener('change', async function(e) {
             });
         }
 
+        const loadMoreWrap = document.getElementById('loadMoreWrap');
+        const loadMoreBtn = document.getElementById('loadMoreBtn');
+
+        function matchesSearch(record, q, filterValue) {
+            const matchQuery =
+                normForSearch(record.playerName).includes(q) ||
+                normForSearch(record.society).includes(q) ||
+                normForSearch(record.tournamentName).includes(q);
+            const matchClass = filterValue === 'all' || record.playerClass === filterValue;
+            return matchQuery && matchClass;
+        }
+
         async function performSearch() {
             const rawQuery = searchInput.value.trim();
             lastSearchQuery = rawQuery;
@@ -1417,56 +1462,71 @@ excelFileInput.addEventListener('change', async function(e) {
 
             if (!q) return;
 
-            const seq = ++searchSeq;
+            searchState = { q, filterValue, cursor: null, hasMore: false, results: [] };
             initialMessage.classList.add('hidden');
             resultsContainer.innerHTML = '';
             emptyMessage.classList.add('hidden');
-            loadingIndicator.classList.remove('hidden');
+            loadMoreWrap.classList.add('hidden');
             resultsHeader.querySelector('span').textContent = `「${rawQuery}」の検索結果`;
+            await loadSearchPage();
+        }
+
+        // 検索結果を SEARCH_PAGE_SIZE 件ずつ取得する（最初の検索・「もっと見る」共通）
+        async function loadSearchPage() {
+            const st = searchState;
+            if (!st) return;
+            const seq = ++searchSeq;
+            const isFirst = st.cursor === null;
+            if (isFirst) loadingIndicator.classList.remove('hidden');
+            loadMoreBtn.disabled = true;
+            loadMoreBtn.textContent = '読み込み中...';
 
             let candidates = [];
-            let truncated = false;
             try {
                 if (isCloudConnected) {
-                    const maxCount = SEARCH_LIMIT;
-                    const qr = fsQuery(recordsColRef, where('searchKeys', 'array-contains', q.slice(0, SEARCH_KEY_LEN)), limit(maxCount));
-                    const snap = await getDocs(qr);
+                    const conds = [where('searchKeys', 'array-contains', st.q.slice(0, SEARCH_KEY_LEN))];
+                    if (st.cursor) conds.push(startAfter(st.cursor));
+                    conds.push(limit(SEARCH_PAGE_SIZE));
+                    const snap = await getDocs(fsQuery(recordsColRef, ...conds));
                     trackUsage('reads', Math.max(1, snap.size));
+                    if (seq !== searchSeq || st !== searchState) return; // 新しい検索が始まっていたら捨てる
                     candidates = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-                    truncated = snap.size >= maxCount;
+                    st.cursor = snap.docs.length ? snap.docs[snap.docs.length - 1] : st.cursor;
+                    st.hasMore = snap.size >= SEARCH_PAGE_SIZE;
                 } else {
                     candidates = appDatabase;
+                    st.hasMore = false;
                 }
             } catch (err) {
                 console.error("Search error:", err);
-                if (seq !== searchSeq) return;
+                if (seq !== searchSeq || st !== searchState) return;
                 loadingIndicator.classList.add('hidden');
-                emptyMessage.classList.remove('hidden');
-                resultCount.textContent = "取得に失敗しました";
+                loadMoreBtn.disabled = false;
+                loadMoreBtn.textContent = 'もっと見る';
+                if (isFirst) {
+                    emptyMessage.classList.remove('hidden');
+                    resultCount.textContent = "取得に失敗しました";
+                } else {
+                    alert("続きの取得に失敗しました。もう一度お試しください。");
+                }
                 return;
             }
-            if (seq !== searchSeq) return; // 新しい検索が始まっていたら捨てる
 
-            const results = candidates.filter(record => {
-                const matchQuery =
-                    normForSearch(record.playerName).includes(q) ||
-                    normForSearch(record.society).includes(q) ||
-                    normForSearch(record.tournamentName).includes(q);
-                const matchClass = filterValue === 'all' || record.playerClass === filterValue;
-                return matchQuery && matchClass;
-            });
-            lastFiltered = results;
+            candidates.forEach(r => { if (matchesSearch(r, st.q, st.filterValue)) st.results.push(r); });
+            lastFiltered = st.results;
 
             loadingIndicator.classList.add('hidden');
+            loadMoreBtn.disabled = false;
+            loadMoreBtn.textContent = 'もっと見る';
+            loadMoreWrap.classList.toggle('hidden', !st.hasMore);
 
-            if (results.length === 0) {
-                emptyMessage.classList.remove('hidden');
-                resultCount.textContent = "0件";
-            } else {
-                resultCount.textContent = `${results.length}件表示` + (truncated ? "（上限のため一部のみ。名前などで絞り込んでください）" : "");
-                renderResults(sortResults(results));
-            }
+            const n = st.results.length;
+            emptyMessage.classList.toggle('hidden', n > 0 || st.hasMore);
+            resultCount.textContent = `${n}件表示` + (st.hasMore ? "（続きがあります）" : "");
+            if (n > 0) renderResults(sortResults(st.results));
+            else resultsContainer.innerHTML = '';
         }
+        loadMoreBtn.addEventListener('click', () => loadSearchPage());
 
         function renderResults(results) {
             resultsContainer.innerHTML = '';
@@ -1583,6 +1643,7 @@ excelFileInput.addEventListener('change', async function(e) {
                 const regSnap = await getDocs(fsQuery(settingsColRef, where('kind', '==', 'file')));
                 trackUsage('reads', Math.max(1, regSnap.size));
                 const regRefs = regSnap.docs.filter(d => d.data().kind === 'file').map(d => d.ref);
+                regRefs.push(fileIndexDocRef);
                 if (regRefs.length) {
                     const batch = writeBatch(db);
                     regRefs.forEach(r => batch.delete(r));
@@ -1592,13 +1653,15 @@ excelFileInput.addEventListener('change', async function(e) {
 
                 appDatabase = [];
                 lastFiltered = null;
+                searchState = null;
                 resultsContainer.innerHTML = '';
+                loadMoreWrap.classList.add('hidden');
                 initialMessage.classList.remove('hidden');
                 document.getElementById('statusText').textContent = "クラウド接続完了";
                 importStatus.textContent = "すべてのデータを消去しました。";
                 importStatus.classList.remove('hidden', 'text-amber-800', 'text-emerald-700');
                 importStatus.classList.add('text-red-600');
-                refreshRecordCount();
+                refreshRecordCount(true);
                 refreshFileList();
             } catch (err) {
                 console.error("Delete error:", err);
@@ -1687,11 +1750,26 @@ excelFileInput.addEventListener('change', async function(e) {
             try {
                 if (isCloudConnected) {
                     if (!isAdminNow()) return;
-                    const snap = await getDocs(fsQuery(settingsColRef, where('kind', '==', 'file')));
-                    trackUsage('reads', Math.max(1, snap.size));
-                    snap.forEach(d => {
-                        const x = d.data();
-                        if (x.kind === 'file') entries.push({ key: x.sourceFile, count: x.count, tournamentName: x.tournamentName, date: x.date });
+                    const idxSnap = await getDoc(fileIndexDocRef);
+                    trackUsage('reads', 1);
+                    let files;
+                    if (idxSnap.exists()) {
+                        files = idxSnap.data().files || {};
+                    } else {
+                        // 旧形式（ファイルごとに1ドキュメント）から一覧ドキュメントを作る（初回のみ）
+                        const snap = await getDocs(fsQuery(settingsColRef, where('kind', '==', 'file')));
+                        trackUsage('reads', Math.max(1, snap.size));
+                        files = {};
+                        snap.forEach(d => {
+                            const x = d.data();
+                            if (x.kind === 'file') files[fileRegId(x.sourceFile)] = { sourceFile: x.sourceFile, count: x.count, tournamentName: x.tournamentName || '', date: x.date || '', updatedAt: x.updatedAt || '' };
+                        });
+                        await setDoc(fileIndexDocRef, { kind: 'file_index', files });
+                        trackUsage('writes', 1);
+                    }
+                    fileIndexReady = true;
+                    Object.values(files).forEach(x => {
+                        if (x && x.sourceFile) entries.push({ key: x.sourceFile, count: x.count, tournamentName: x.tournamentName, date: x.date });
                     });
                 } else {
                     const map = new Map();
@@ -1721,6 +1799,7 @@ excelFileInput.addEventListener('change', async function(e) {
             if (!confirm(`次のファイルから取り込んだデータを削除します。\n\n${listText}\n\nこの操作は元に戻せません。よろしいですか？`)) return;
 
             deleteFileBtn.disabled = true;
+            if (isCloudConnected && !fileIndexReady) await refreshFileList();
             let totalDeleted = 0;
             const failed = [];
             for (const key of keys) {
@@ -1737,7 +1816,9 @@ excelFileInput.addEventListener('change', async function(e) {
                             trackUsage('deletes', Math.min(400, refs.length - i));
                         }
                         totalDeleted += refs.length;
-                        await deleteDoc(doc(settingsColRef, fileRegId(key)));
+                        await setDoc(fileIndexDocRef, { files: { [fileRegId(key)]: deleteField() } }, { merge: true });
+                        trackUsage('writes', 1);
+                        await deleteDoc(doc(settingsColRef, fileRegId(key)));   // 旧形式のドキュメントも消しておく
                         trackUsage('deletes', 1);
                     } else {
                         const before = appDatabase.length;
@@ -1753,7 +1834,7 @@ excelFileInput.addEventListener('change', async function(e) {
             }
             lastFiltered = null;
             await refreshFileList();
-            refreshRecordCount();
+            refreshRecordCount(true);
             if (lastSearchQuery) performSearch();
             if (failed.length === 0) {
                 showImportStatus(`${keys.length}個のファイル（${totalDeleted}件）を削除しました。`, 'text-red-600');
@@ -1795,20 +1876,14 @@ excelFileInput.addEventListener('change', async function(e) {
                 if (pending > 0) { await batch.commit(); trackUsage('writes', pending); }
 
                 // 取り込み済みファイルの一覧を作り直す
-                const regEntries = Array.from(reg.entries());
-                for (let i = 0; i < regEntries.length; i += 400) {
-                    const rb = writeBatch(db);
-                    regEntries.slice(i, i + 400).forEach(([key, v]) => {
-                        rb.set(doc(settingsColRef, fileRegId(key)), {
-                            kind: 'file', sourceFile: key, count: v.count,
-                            tournamentName: v.tournamentName, date: v.date, updatedAt: new Date().toISOString()
-                        });
-                    });
-                    await rb.commit();
-                    trackUsage('writes', Math.min(400, regEntries.length - i));
-                }
+                const files = {};
+                reg.forEach((v, key) => {
+                    files[fileRegId(key)] = { sourceFile: key, count: v.count, tournamentName: v.tournamentName, date: v.date, updatedAt: new Date().toISOString() };
+                });
+                await setDoc(fileIndexDocRef, { kind: 'file_index', files });
+                trackUsage('writes', 1);
                 showImportStatus(`変換が完了しました（全${total}件中、${updated}件を更新）。`, 'text-emerald-700');
-                refreshRecordCount();
+                refreshRecordCount(true);
                 refreshFileList();
             } catch (err) {
                 console.error("Migration error:", err);
