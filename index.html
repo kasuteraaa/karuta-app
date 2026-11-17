@@ -207,9 +207,6 @@
                 <div id="importStatus" class="text-xs mt-2 font-bold text-emerald-700 hidden"></div>
 
                 <div class="mt-4 pt-3 border-t border-amber-300/50">
-                    <h4 class="text-xs font-bold text-amber-950 mb-1 font-karuta">⚡ 既存データを高速検索用に変換</h4>
-                    <p class="text-[10px] text-amber-900/70 mb-1.5">以前に取り込んだデータは、一度だけ変換すると高速に検索できます（新しく取り込むデータは自動で対応済みです）。</p>
-                    <button id="migrateBtn" class="bg-amber-700 hover:bg-amber-800 text-white px-3 py-1.5 rounded-md text-xs font-bold mb-4 disabled:opacity-40">変換を実行</button>
                     <h4 class="text-xs font-bold text-amber-950 mb-1.5 font-karuta">🗑 取り込み済みファイルの検索・削除</h4>
                     <input id="fileSearchInput" type="text" placeholder="ファイル名・大会名・開催年月で検索" class="w-full rounded-md border border-amber-300 p-1.5 text-xs bg-white mb-2">
                     <div id="fileList" class="max-h-52 overflow-y-auto border border-amber-200 rounded-md bg-white divide-y divide-amber-100 text-xs"></div>
@@ -565,6 +562,59 @@
             return Array.from(keys);
         }
         const fileRegId = (key) => 'file__' + String(key).replace(/[\/\\\s.#\[\]?]+/g, '_');
+
+        // ===== 書き込み・削除を「サイズを見積もって分割」して実行する =====
+        // Firestoreは1回のコミットが約10MiBまで。検索用キー(インデックス)が多い大会名・長いファイル名だと、
+        // 400件まとめて書くと上限を超えるため、サイズを見積もって小分けにし、それでも失敗したら半分にして再試行する。
+        const utf8Len = (str) => new TextEncoder().encode(String(str)).length;
+        const COMMIT_MAX_BYTES = 4 * 1024 * 1024;   // 1回のコミットの目安（上限10MiBに対して余裕を持たせる）
+        const COMMIT_MAX_DOCS = 300;
+        function estimateWriteBytes(docId, payload) {
+            const pathBytes = utf8Len(`artifacts/${appId}/public/data/tournament_records/${docId}`);
+            const bodyBytes = utf8Len(JSON.stringify(payload));
+            const indexEntries = (payload.searchKeys ? payload.searchKeys.length : 0) + 60; // 配列の各要素＋その他の項目
+            return bodyBytes + indexEntries * (pathBytes + 48);
+        }
+        async function commitWithSplit(items, addToBatch, onCommitted) {
+            if (items.length === 0) return;
+            try {
+                const batch = writeBatch(db);
+                items.forEach(it => addToBatch(batch, it));
+                await batch.commit();
+                onCommitted(items.length);
+            } catch (err) {
+                const tooBig = err && (err.code === 'invalid-argument' || /too big|too large|size/i.test(err.message || ''));
+                if (tooBig && items.length > 1) {
+                    const mid = Math.ceil(items.length / 2);
+                    await commitWithSplit(items.slice(0, mid), addToBatch, onCommitted);
+                    await commitWithSplit(items.slice(mid), addToBatch, onCommitted);
+                } else {
+                    throw err;
+                }
+            }
+        }
+        async function writeRecordsSafely(records, onProgress) {
+            let i = 0, done = 0;
+            while (i < records.length) {
+                let end = i, size = 0;
+                while (end < records.length && end - i < COMMIT_MAX_DOCS) {
+                    const { _docId, ...payload } = records[end];
+                    const est = estimateWriteBytes(_docId, payload);
+                    if (end > i && size + est > COMMIT_MAX_BYTES) break;
+                    size += est; end++;
+                }
+                await commitWithSplit(records.slice(i, end), (batch, rec) => {
+                    const { _docId, ...payload } = rec;
+                    batch.set(doc(recordsColRef, _docId), payload);
+                }, (n) => { trackUsage('writes', n); done += n; if (onProgress) onProgress(done, records.length); });
+                i = end;
+            }
+        }
+        async function deleteRefsSafely(refs) {
+            for (let i = 0; i < refs.length; i += 100) {
+                await commitWithSplit(refs.slice(i, i + 100), (batch, ref) => batch.delete(ref), (n) => trackUsage('deletes', n));
+            }
+        }
 
         // ===== Firebase 利用状況の記録（このサイトからの読み取り・書き込み・削除を30分ごとに集計） =====
         const USAGE_BUCKET_MS = 30 * 60 * 1000;          // 30分
@@ -1085,6 +1135,7 @@ excelFileInput.addEventListener('change', async function(e) {
                     .replace(/(大会)?(結果|報告)/g, "$1")
                     .replace(/最終|確定|修正|仮|V[0-9]+(?:[ _][0-9]+)*/gi, "")
                     .replace(/[()（）]/g, " ")
+                    .replace(/[-ー－\s]*[A-EＡ-Ｅ]{2,5}\s*$/, "")   // 末尾の「-ABCDE」など
                     .replace(/\s+/g, " ").trim();
                 return t || base;
             };
@@ -1105,7 +1156,53 @@ excelFileInput.addEventListener('change', async function(e) {
                         }
                     }
                 }
+                // 「第N回」が付かない大会名（例: 「令和8年熊本地震復興支援チャリティー大会」）：先頭付近のセルで「〜大会」で終わるもの
+                for (const name of workbook.SheetNames.slice(0, 2)) {
+                    const ws = workbook.Sheets[name];
+                    if (!ws) continue;
+                    for (const row of topCells(ws, 4)) {
+                        for (const cell of row) {
+                            if (typeof cell !== "string") continue;
+                            const t = toHalf(cellStr(cell)).replace(/\s+/g, "");
+                            if (/^[^。、，．,]{4,40}大会$/.test(t)) return t;
+                        }
+                    }
+                }
                 return null;
+            }
+            // 「2026年9月」「令和8年9月」「平成30年4月」を { y, m } に直す
+            const DATE_YM_RE = /(?:(令和|平成)\s*(\d{1,2}|元)\s*年|(20\d{2})\s*年)\s*(\d{1,2})\s*月/;
+            function ymFromMatch(m) {
+                let y;
+                if (m[1]) {
+                    const n = m[2] === "元" ? 1 : parseInt(m[2], 10);
+                    y = (m[1] === "令和" ? 2018 : 1988) + n;
+                } else {
+                    y = parseInt(m[3], 10);
+                }
+                const mo = parseInt(m[4], 10);
+                return (y >= 2000 && mo >= 1 && mo <= 12) ? { y, m: mo } : null;
+            }
+            // 「【D級】令和8年9月21日」のように、級ごとに開催日が書かれている場合は級ごとの年月を返す
+            function detectClassDates(workbook) {
+                const map = {};
+                const re = /【\s*([A-EＡ-Ｅ])\s*[0-9０-９]*\s*級\s*】\s*((?:令和|平成)\s*(?:\d{1,2}|元)\s*年|20\d{2}\s*年)\s*(\d{1,2})\s*月/;
+                for (const name of workbook.SheetNames) {
+                    const ws = workbook.Sheets[name];
+                    if (!ws) continue;
+                    for (const row of topCells(ws, 40, 8)) {
+                        for (const cell of row) {
+                            if (typeof cell !== "string") continue;
+                            const m = toHalf(cell).match(re);
+                            if (!m) continue;
+                            const ym = toHalf(m[2] + m[3] + "月").match(DATE_YM_RE);
+                            const v = ym && ymFromMatch(ym);
+                            const letter = toHalf(m[1]).toUpperCase();
+                            if (v && !map[letter]) map[letter] = v;
+                        }
+                    }
+                }
+                return map;
             }
             // ファイル内から開催年月を推定して { y, m } を返す（月が不明なら m = 0、全く不明なら null）
             function detectDate(workbook, baseName) {
@@ -1115,8 +1212,8 @@ excelFileInput.addEventListener('change', async function(e) {
                     for (const row of topCells(ws, 20)) {
                         for (const cell of row) {
                             if (typeof cell !== "string") continue;
-                            const m = toHalf(cell).match(/(20\d{2})\s*年\s*(\d{1,2})\s*月/);
-                            if (m) return { y: parseInt(m[1], 10), m: parseInt(m[2], 10) };
+                            const m = toHalf(cell).match(DATE_YM_RE);
+                            if (m) { const ym = ymFromMatch(m); if (ym) return ym; }
                         }
                     }
                 }
@@ -1156,10 +1253,17 @@ excelFileInput.addEventListener('change', async function(e) {
                 const now = new Date();
                 const detected = detectDate(workbook, baseName) || { y: now.getFullYear(), m: now.getMonth() + 1 };
                 const ov = dateOverride || {};
-                const evYear = ov.y || detected.y;
-                const evMonth = ov.m ? ov.m : (ov.y && ov.y !== detected.y ? 0 : detected.m);
-                const dateLabel = evMonth ? `${evYear}年${evMonth}月` : `${evYear}年`;
-                const eventKey = evYear * 100 + evMonth; // 並べ替え用（例: 202609）
+                const classDates = detectClassDates(workbook);   // 級ごとに開催日が書かれている大会用
+                const dateFor = (letter) => {
+                    const det = (letter && classDates[letter]) || detected;
+                    const evYear = ov.y || det.y;
+                    const evMonth = ov.m ? ov.m : (ov.y && ov.y !== det.y ? 0 : det.m);
+                    return {
+                        evYear, evMonth,
+                        label: evMonth ? `${evYear}年${evMonth}月` : `${evYear}年`,
+                        key: evYear * 100 + evMonth   // 並べ替え用（例: 202609）
+                    };
+                };
 
                 // 全シートを見出しの中身で解析する（シート名には頼らない）
                 const analyzed = [];
@@ -1244,16 +1348,17 @@ excelFileInput.addEventListener('change', async function(e) {
                             || (layout.classCol2 !== null && detectClass(get(layout.classCol2)))
                             || sheetLetter;
                         const sheetClass = rowLetter ? rowLetter + "級" : "不明";
+                        const dt = dateFor(rowLetter);
 
                         const record = {
                             playerName,
                             society,
                             playerClass: sheetClass,
                             tournamentName,
-                            date: dateLabel,
-                            eventYear: evYear,
-                            eventMonth: evMonth,
-                            eventKey,
+                            date: dt.label,
+                            eventYear: dt.evYear,
+                            eventMonth: dt.evMonth,
+                            eventKey: dt.key,
                             result: "",
                             matches: []
                         };
@@ -1337,7 +1442,7 @@ excelFileInput.addEventListener('change', async function(e) {
                         y: parseInt(importYearSel.value, 10) || 0,
                         m: parseInt(importMonthSel.value, 10) || 0
                     });
-                    if (records.length > 0) usedDates.add(records[0].date);
+                    records.forEach(r => usedDates.add(r.date));
                     fileNotes.forEach(n => allNotes.push(`${file.name} ${n}`));
 
                     if (records.length === 0) {
@@ -1346,16 +1451,10 @@ excelFileInput.addEventListener('change', async function(e) {
 
                     if (isCloudConnected && auth.currentUser) {
                         if (!fileIndexReady) await refreshFileList();   // 一覧ドキュメントを先に用意しておく
-                        // Firestoreのバッチ書き込み（1回あたり最大500件のため400件ずつ）
-                        for (let i = 0; i < records.length; i += 400) {
-                            const batch = writeBatch(db);
-                            records.slice(i, i + 400).forEach(rec => {
-                                const { _docId, ...payload } = rec;
-                                batch.set(doc(recordsColRef, _docId), payload);
-                            });
-                            await batch.commit();
-                            trackUsage('writes', Math.min(400, records.length - i));
-                        }
+                        // Firestoreへ書き込み（サイズを見積もって小分けにする）
+                        await writeRecordsSafely(records, (done, total) => {
+                            setStatus(`${file.name} を保存しています... ${done} / ${total} 件`, 'progress');
+                        });
                         // 取り込み済みファイルの一覧（削除用）に登録
                         await setDoc(fileIndexDocRef, {
                             kind: 'file_index',
@@ -1633,23 +1732,13 @@ excelFileInput.addEventListener('change', async function(e) {
                 const snapshot = await getDocs(recordsColRef);
                 trackUsage('reads', Math.max(1, snapshot.size));
                 const refs = snapshot.docs.map(d => d.ref);
-                for (let i = 0; i < refs.length; i += 400) {
-                    const batch = writeBatch(db);
-                    refs.slice(i, i + 400).forEach(r => batch.delete(r));
-                    await batch.commit();
-                    trackUsage('deletes', Math.min(400, refs.length - i));
-                }
+                await deleteRefsSafely(refs);
                 // 取り込み済みファイルの一覧も消す
                 const regSnap = await getDocs(fsQuery(settingsColRef, where('kind', '==', 'file')));
                 trackUsage('reads', Math.max(1, regSnap.size));
                 const regRefs = regSnap.docs.filter(d => d.data().kind === 'file').map(d => d.ref);
                 regRefs.push(fileIndexDocRef);
-                if (regRefs.length) {
-                    const batch = writeBatch(db);
-                    regRefs.forEach(r => batch.delete(r));
-                    await batch.commit();
-                    trackUsage('deletes', regRefs.length);
-                }
+                if (regRefs.length) await deleteRefsSafely(regRefs);
 
                 appDatabase = [];
                 lastFiltered = null;
@@ -1674,7 +1763,6 @@ excelFileInput.addEventListener('change', async function(e) {
         const fileSearchInput = document.getElementById('fileSearchInput');
         const fileSelectedInfo = document.getElementById('fileSelectedInfo');
         const deleteFileBtn = document.getElementById('deleteFileBtn');
-        const migrateBtn = document.getElementById('migrateBtn');
         const isAdminNow = () => !!(auth.currentUser && auth.currentUser.email === ADMIN_EMAIL);
 
         // レコードがどのファイルから取り込まれたかを返す（古いデータはIDから復元）
@@ -1713,7 +1801,7 @@ excelFileInput.addEventListener('change', async function(e) {
                 const empty = document.createElement('div');
                 empty.className = 'p-3 text-center text-stone-500';
                 empty.textContent = fileEntries.length === 0
-                    ? '取り込み済みのファイルはありません（以前のデータは「変換を実行」後に表示されます）'
+                    ? '取り込み済みのファイルはありません'
                     : '該当するファイルがありません';
                 fileListEl.appendChild(empty);
             }
@@ -1809,12 +1897,7 @@ excelFileInput.addEventListener('change', async function(e) {
                         const snap = await getDocs(fsQuery(recordsColRef, where('sourceFile', '==', key)));
                         trackUsage('reads', Math.max(1, snap.size));
                         const refs = snap.docs.map(d => d.ref);
-                        for (let i = 0; i < refs.length; i += 400) {
-                            const batch = writeBatch(db);
-                            refs.slice(i, i + 400).forEach(r => batch.delete(r));
-                            await batch.commit();
-                            trackUsage('deletes', Math.min(400, refs.length - i));
-                        }
+                        await deleteRefsSafely(refs);
                         totalDeleted += refs.length;
                         await setDoc(fileIndexDocRef, { files: { [fileRegId(key)]: deleteField() } }, { merge: true });
                         trackUsage('writes', 1);
@@ -1840,56 +1923,6 @@ excelFileInput.addEventListener('change', async function(e) {
                 showImportStatus(`${keys.length}個のファイル（${totalDeleted}件）を削除しました。`, 'text-red-600');
             } else {
                 showImportStatus(`一部の削除に失敗しました → ${failed.join(' / ')}`, 'text-red-600');
-            }
-        });
-
-        // 既存データ（検索用キーなし）を、高速検索できる形式に一括変換する
-        migrateBtn.addEventListener('click', async () => {
-            if (!isAdminNow() || !isCloudConnected) { alert("管理者としてログインしてください。"); return; }
-            if (!confirm("既存のデータを高速検索用の形式に変換します（初回のみ・数分かかる場合があります）。実行しますか？")) return;
-            migrateBtn.disabled = true;
-            try {
-                showImportStatus("既存データを読み込んでいます...", 'text-amber-800');
-                const snap = await getDocs(recordsColRef);
-                trackUsage('reads', Math.max(1, snap.size));
-                const total = snap.size;
-                const reg = new Map();
-                let batch = writeBatch(db), pending = 0, updated = 0, seen = 0;
-                for (const d of snap.docs) {
-                    const data = d.data();
-                    const src = getSourceFile({ id: d.id, ...data });
-                    const r = reg.get(src) || { count: 0, tournamentName: data.tournamentName || '', date: data.date || '' };
-                    r.count++;
-                    reg.set(src, r);
-                    if (!Array.isArray(data.searchKeys) || typeof data.eventKey !== 'number' || !data.sourceFile) {
-                        batch.update(d.ref, { searchKeys: buildSearchKeys(data), eventKey: getEventKey(data), sourceFile: src });
-                        pending++; updated++;
-                        if (pending >= 400) {
-                            await batch.commit();
-                            trackUsage('writes', pending);
-                            batch = writeBatch(db); pending = 0;
-                            showImportStatus(`変換中... ${seen + 1} / ${total} 件`, 'text-amber-800');
-                        }
-                    }
-                    seen++;
-                }
-                if (pending > 0) { await batch.commit(); trackUsage('writes', pending); }
-
-                // 取り込み済みファイルの一覧を作り直す
-                const files = {};
-                reg.forEach((v, key) => {
-                    files[fileRegId(key)] = { sourceFile: key, count: v.count, tournamentName: v.tournamentName, date: v.date, updatedAt: new Date().toISOString() };
-                });
-                await setDoc(fileIndexDocRef, { kind: 'file_index', files });
-                trackUsage('writes', 1);
-                showImportStatus(`変換が完了しました（全${total}件中、${updated}件を更新）。`, 'text-emerald-700');
-                refreshRecordCount(true);
-                refreshFileList();
-            } catch (err) {
-                console.error("Migration error:", err);
-                showImportStatus(`変換に失敗しました：${(err && err.message) || err}`, 'text-red-600');
-            } finally {
-                migrateBtn.disabled = false;
             }
         });
 
