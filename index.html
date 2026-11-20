@@ -136,6 +136,13 @@
     <div class="app-container" id="app">
         <!-- Header -->
         <header class="header-tatami p-4 shadow-lg">
+            <!-- 前の画面に戻るボタン（対戦相手の名前から検索したときだけ表示） -->
+            <div id="navBackRow" class="hidden mb-2 text-left">
+                <button id="navBackBtn" type="button" class="inline-flex items-center gap-1 text-sm font-bold text-amber-100 bg-white/15 hover:bg-white/25 border border-amber-200/40 rounded-lg px-3 py-1.5">
+                    <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7" /></svg>
+                    前の画面に戻る
+                </button>
+            </div>
             <div class="flex items-center justify-center gap-2">
                 <!-- SVG App Icon -->
                 <svg class="w-8 h-8 filter drop-shadow" viewBox="0 0 100 100">
@@ -222,7 +229,7 @@
             <div class="mb-5 bg-white p-4 rounded-xl border-2 border-stone-200 shadow-sm">
                 <label for="searchInput" class="block text-xs font-bold text-stone-700 mb-1.5 font-karuta">選手名・所属会・大会名で検索</label>
                 <div class="flex gap-2">
-                    <input type="text" id="searchInput" placeholder="例: 綾瀬 千早 / 府中会 / 香川大会" 
+                    <input type="text" id="searchInput" 
                            class="flex-1 rounded-lg border-stone-300 shadow-sm focus:border-amber-600 focus:ring-amber-600 border p-2.5 text-base bg-amber-50/20">
                     <button id="searchButton" class="bg-amber-700 hover:bg-amber-800 text-amber-50 font-bold py-2.5 px-5 rounded-lg transition text-sm shadow">
                         検索
@@ -355,6 +362,7 @@
             <p class="text-xs text-stone-600 mb-4 border-b pb-2 font-medium" id="modalPlayerInfo">選手名 - 所属会</p>
             
             <div id="modalMatchList" class="space-y-2"></div>
+            <p class="text-[10px] text-stone-400 mt-2">※ 相手の名前（下線つき）をタップすると、その選手の記録を検索できます。</p>
             
             <div class="mt-6 flex justify-end">
                 <button id="closeModalBtnBottom" class="bg-stone-200 hover:bg-stone-300 text-stone-800 font-bold py-2 px-5 rounded-lg text-xs">
@@ -1561,7 +1569,7 @@ excelFileInput.addEventListener('change', async function(e) {
 
             if (!q) return;
 
-            searchState = { q, filterValue, cursor: null, hasMore: false, results: [] };
+            searchState = { q, rawQuery, filterValue, cursor: null, hasMore: false, results: [] };
             initialMessage.classList.add('hidden');
             resultsContainer.innerHTML = '';
             emptyMessage.classList.add('hidden');
@@ -1612,8 +1620,14 @@ excelFileInput.addEventListener('change', async function(e) {
             }
 
             candidates.forEach(r => { if (matchesSearch(r, st.q, st.filterValue)) st.results.push(r); });
-            lastFiltered = st.results;
+            renderSearchState(st);
+        }
 
+        // 保存してある検索結果を画面に表示する（読み取りは発生しない）
+        function renderSearchState(st) {
+            lastFiltered = st.results;
+            initialMessage.classList.add('hidden');
+            resultsHeader.querySelector('span').textContent = `「${st.rawQuery}」の検索結果`;
             loadingIndicator.classList.add('hidden');
             loadMoreBtn.disabled = false;
             loadMoreBtn.textContent = 'もっと見る';
@@ -1625,6 +1639,61 @@ excelFileInput.addEventListener('change', async function(e) {
             if (n > 0) renderResults(sortResults(st.results));
             else resultsContainer.innerHTML = '';
         }
+
+        // ===== 対戦相手の名前から検索 → 「前の画面に戻る」 =====
+        const navBackRow = document.getElementById('navBackRow');
+        const navBackBtn = document.getElementById('navBackBtn');
+        let navStack = [];   // 戻るための履歴（直前の検索結果と、開いていた詳細画面）
+
+        const isSearchableName = (name) => {
+            const t = String(name || '').trim();
+            return t !== '' && t !== '対戦相手不明' && !/^[（(].*[）)]$/.test(t);
+        };
+        function updateNavBack() {
+            navBackRow.classList.toggle('hidden', navStack.length === 0);
+        }
+        function resetNav() {
+            navStack = [];
+            updateNavBack();
+        }
+        function searchOpponent(name, fromRecord) {
+            // 今の画面（検索結果＋開いていた詳細）を保存してから、相手の名前で検索する
+            navStack.push({
+                rawQuery: searchInput.value,
+                filter: classFilter.value,
+                state: searchState,
+                record: fromRecord,
+                scrollY: window.scrollY
+            });
+            updateNavBack();
+            closeModal();
+            searchInput.value = name;
+            classFilter.value = 'all';   // 相手の級が違っても見つかるようにする
+            window.scrollTo(0, 0);
+            performSearch();
+        }
+        function goBackNav() {
+            const e = navStack.pop();
+            if (!e) return;
+            updateNavBack();
+            searchInput.value = e.rawQuery;
+            classFilter.value = e.filter;
+            lastSearchQuery = e.rawQuery.trim();
+            searchState = e.state;   // 進行中だった別の検索の結果は破棄される
+            if (e.state) {
+                renderSearchState(e.state);
+            } else {
+                resultsContainer.innerHTML = '';
+                loadingIndicator.classList.add('hidden');
+                loadMoreWrap.classList.add('hidden');
+                emptyMessage.classList.add('hidden');
+                resultCount.textContent = '';
+                initialMessage.classList.remove('hidden');
+            }
+            if (e.record) openModal(e.record);   // 見ていた詳細画面を開き直す
+            requestAnimationFrame(() => window.scrollTo(0, e.scrollY || 0));
+        }
+        navBackBtn.addEventListener('click', goBackNav);
         loadMoreBtn.addEventListener('click', () => loadSearchPage());
 
         function renderResults(results) {
@@ -1693,14 +1762,28 @@ excelFileInput.addEventListener('change', async function(e) {
                                 ${badgeText}
                             </span>
                             <div>
-                                <p class="text-xs font-bold text-stone-800">${match.opponent}</p>
-                                <p class="text-[10px] text-stone-400">${match.opponentSociety}</p>
+                                <p class="opp-name text-xs font-bold text-stone-800"></p>
+                                <p class="opp-soc text-[10px] text-stone-400"></p>
                             </div>
                         </div>
                         <div class="text-xs font-bold ${isWin ? 'text-red-700' : 'text-blue-800'}">
                             ${match.margin ? match.margin + '枚差' : (match.note || '')}
                         </div>
                     `;
+                    // 相手の名前・所属（文字として安全に入れる）
+                    const oppEl = matchEl.querySelector('.opp-name');
+                    oppEl.textContent = match.opponent || '';
+                    matchEl.querySelector('.opp-soc').textContent = match.opponentSociety || '';
+                    // 名前がわかる相手は、タップでその選手を検索できるようにする
+                    if (isSearchableName(match.opponent)) {
+                        oppEl.classList.add('text-amber-800', 'underline', 'decoration-dotted', 'underline-offset-2', 'cursor-pointer', 'hover:text-amber-950');
+                        oppEl.setAttribute('role', 'link');
+                        oppEl.setAttribute('tabindex', '0');
+                        oppEl.title = `「${match.opponent}」を検索`;
+                        const go = () => searchOpponent(match.opponent, record);
+                        oppEl.addEventListener('click', (ev) => { ev.stopPropagation(); go(); });
+                        oppEl.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); go(); } });
+                    }
                     modalMatchList.appendChild(matchEl);
                 });
             } else {
@@ -2116,13 +2199,14 @@ excelFileInput.addEventListener('change', async function(e) {
         usageRange.addEventListener('change', loadUsage);
 
         // Event Listeners Setup
-        searchButton.addEventListener('click', () => performSearch());
+        searchButton.addEventListener('click', () => { resetNav(); performSearch(); });
         sortOrder.addEventListener('change', () => {
             if (lastFiltered && lastFiltered.length) renderResults(sortResults(lastFiltered));
         });
         
         searchInput.addEventListener('keypress', function (e) {
             if (e.key === 'Enter') {
+                resetNav();
                 performSearch();
             }
         });
