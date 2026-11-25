@@ -263,15 +263,43 @@
 
                     </div>
                 </div>
+
+                <!-- 詳細な絞り込み（検索結果が出たら表示） -->
+                <div id="extraFilterRow" class="hidden mt-2.5 pt-2.5 border-t border-stone-100 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
+                    <label class="flex items-center gap-1.5 font-bold text-stone-600">年:
+                        <select id="yearFilter" class="rounded-md border-stone-300 p-1.5 border text-xs bg-stone-50 font-medium"><option value="">すべて</option></select>
+                    </label>
+                    <label class="flex items-center gap-1.5 font-bold text-stone-600">大会:
+                        <select id="tournamentFilter" class="rounded-md border-stone-300 p-1.5 border text-xs bg-stone-50 font-medium" style="max-width:11rem"><option value="">すべて</option></select>
+                    </label>
+                    <label class="flex items-center gap-1.5 font-bold text-stone-600">成績:
+                        <select id="perfFilter" class="rounded-md border-stone-300 p-1.5 border text-xs bg-stone-50 font-medium">
+                            <option value="">すべて</option>
+                            <option value="champion">優勝</option>
+                            <option value="podium">入賞（3位以内）</option>
+                            <option value="unbeaten">全勝</option>
+                            <option value="winning">勝ち越し</option>
+                        </select>
+                    </label>
+                    <label class="flex items-center gap-1.5 font-bold text-stone-600 cursor-pointer">
+                        <input type="checkbox" id="groupToggle"> 大会ごとにまとめる
+                    </label>
+                    <span class="text-[10px] text-stone-400 w-full">※ 優勝・入賞は、順位が記録されている大会だけが対象です。</span>
+                </div>
             </div>
 
             <!-- Results Section -->
             <div>
                 <h2 class="text-base font-bold border-b-2 border-amber-600/30 pb-2 mb-3 text-stone-800 flex justify-between items-center font-karuta" id="resultsHeader">
                     <span>検索結果</span>
-                    <span id="resultCount" class="text-xs font-sans font-normal text-stone-500"></span>
+                    <span class="flex items-center gap-2">
+                        <span id="resultCount" class="text-xs font-sans font-normal text-stone-500"></span>
+                        <button id="copyLinkBtn" type="button" class="hidden text-[11px] font-sans font-bold bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded px-2 py-0.5">🔗 リンクをコピー</button>
+                    </span>
                 </h2>
                 
+                <div id="playerSummary" class="hidden mb-3"></div>
+
                 <div id="initialMessage" class="text-center text-stone-500 py-10">
                     <div class="w-12 h-12 bg-amber-100/60 rounded-full flex items-center justify-center mx-auto mb-3 text-amber-800">
                         <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -350,6 +378,19 @@
         <p class="mt-1 text-xs text-stone-500">クラウドからデータを読み込んでいます</p>
     </div>
 
+    <!-- 取り込み前の確認画面（管理者） -->
+    <div id="importPreviewModal" class="modal-overlay hidden" style="z-index:55">
+        <div class="modal-content relative" style="max-width:44rem;width:96%">
+            <h3 class="text-lg font-bold text-emerald-950 font-karuta">取り込み内容の確認</h3>
+            <p class="text-xs text-stone-600 mt-1">保存する前に内容を確認してください。大会名や開催年月は、ここで直せます。</p>
+            <div id="importPreviewBody" class="space-y-3 mt-3"></div>
+            <div class="mt-4 flex justify-end gap-2 sticky bottom-0 bg-white pt-2">
+                <button id="importPreviewCancel" type="button" class="bg-stone-200 hover:bg-stone-300 text-stone-800 font-bold py-2 px-4 rounded-lg text-sm">キャンセル</button>
+                <button id="importPreviewOk" type="button" class="bg-emerald-700 hover:bg-emerald-800 disabled:opacity-40 text-white font-bold py-2 px-4 rounded-lg text-sm">この内容で保存</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Match Detail Modal -->
     <div id="detailModal" class="modal-overlay hidden">
         <div class="modal-content relative">
@@ -362,7 +403,7 @@
             <p class="text-xs text-stone-600 mb-4 border-b pb-2 font-medium" id="modalPlayerInfo">選手名 - 所属会</p>
             
             <div id="modalMatchList" class="space-y-2"></div>
-            <p class="text-[10px] text-stone-400 mt-2">※ 相手の名前（下線つき）をタップすると、その選手の記録を検索できます。</p>
+            <p class="text-[10px] text-stone-400 mt-2">※ 相手の名前（下線つき）をタップすると、その選手の記録を検索できます。「通算対戦成績」は、これまでに読み込んだ記録から集計しています。</p>
             
             <div class="mt-6 flex justify-end">
                 <button id="closeModalBtnBottom" class="bg-stone-200 hover:bg-stone-300 text-stone-800 font-bold py-2 px-5 rounded-lg text-xs">
@@ -522,6 +563,8 @@
 
         let appDatabase = [];
         let isCloudConnected = false;
+        let appReady = false;            // 起動処理が終わったか
+        let pendingUrlRestore = false;   // URLの検索条件を、合言葉の入力後に実行する
 
         // ===== Now loading 表示 =====
         const bootLoadingEl = document.getElementById('bootLoading');
@@ -553,22 +596,269 @@
         let lastFiltered = null;      // 直前の検索結果（並び順の切り替え用）
         let searchSeq = 0;
 
-        // ===== 検索用キー：名前・所属・大会名の「4文字までの部分文字列」を保存しておき、
+        // ===== BEGIN PURE =====
+        // ===== 検索用キー：名前・ふりがな・所属・大会名の「4文字までの部分文字列」を保存しておき、
         //       クラウド側で絞り込んで必要な分だけ取得する（全件を読み込まない） =====
         const SEARCH_KEY_LEN = 4;
+
+        // 同じ字として扱う異体字（先頭の字にそろえて検索する）
+        const VARIANT_GROUPS = [
+            '辺邉邊', '崎﨑嵜', '高髙', '斉齋齊斎', '沢澤', '浜濱', '徳德', '桜櫻', '広廣', '国國',
+            '島嶋嶌', '富冨', '吉𠮷', '柳栁', '村邨', '真眞', '青靑', '実實', '頼賴', '竜龍',
+            '滝瀧', '渕淵', '増增', '恵惠', '栄榮', '学學', '関關', '渋澁', '仏佛', '円圓',
+            '鴎鷗', '寿壽', '対對', '当當', '台臺', '瀬瀨', '礼禮', '蔵藏', '橋𣘺', '桑桒',
+            '恒恆', '弥彌', '歳歲', '与與', '児兒', '壱壹', '参參', '県縣', '観觀', '豊豐',
+            '峰峯', '浅淺', '達逹', '黒黑', '塩鹽', '厳嚴', '寛寬', '園薗', '枡桝', '禰祢',
+            '土圡', '荘莊', '摑掴', '埼﨑'
+        ];
+        const VARIANT_CANON = new Map();   // 異体字 → 代表の字
+        const VARIANT_ALL = new Map();     // 代表の字 → [代表, 異体字...]
+        VARIANT_GROUPS.forEach(g => {
+            const chars = Array.from(g);
+            chars.forEach(c => { if (!VARIANT_CANON.has(c)) VARIANT_CANON.set(c, chars[0]); });
+            if (!VARIANT_ALL.has(chars[0])) VARIANT_ALL.set(chars[0], chars);
+        });
+        const toHiragana = (s) => s.replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+        const toKatakana = (s) => s.replace(/[ぁ-ゖ]/g, c => String.fromCharCode(c.charCodeAt(0) + 0x60));
+
+        // 検索用にそろえる：全角/半角・大文字/小文字・空白・カタカナ/ひらがな・異体字
         function normForSearch(text) {
-            return String(text || '').toLowerCase().replace(/[\s　]+/g, '');
+            let t = String(text === undefined || text === null ? '' : text).normalize('NFKC').toLowerCase()
+                .replace(/[\s\u3000・･·.,、。]+/g, '')
+                .replace(/ヶ/g, 'ケ').replace(/ヵ/g, 'カ');
+            t = toHiragana(t);
+            return Array.from(t).map(c => VARIANT_CANON.get(c) || c).join('');
         }
+
+        // 検索語の先頭n文字について、「異体字の組み合わせ」を列挙する（古いデータにも当たるように）
+        function gramVariants(gram) {
+            let combos = [''];
+            for (const ch of Array.from(gram)) {
+                const opts = VARIANT_ALL.get(ch) || [ch];
+                const next = [];
+                for (const c of combos) for (const o of opts) next.push(c + o);
+                if (next.length > 28) return null;
+                combos = next;
+            }
+            if (/[ぁ-ゖ]/.test(gram)) {
+                const k = toKatakana(gram);
+                if (!combos.includes(k)) combos.push(k);
+            }
+            return combos;
+        }
+        function pickGramVariants(q) {
+            const chars = Array.from(q);
+            for (let len = Math.min(SEARCH_KEY_LEN, chars.length); len >= 1; len--) {
+                const v = gramVariants(chars.slice(0, len).join(''));
+                if (v) return v;
+            }
+            return [chars[0] || q];
+        }
+
         function buildSearchKeys(rec) {
             const keys = new Set();
-            [rec.playerName, rec.society, rec.tournamentName].forEach(field => {
-                const t = normForSearch(field).slice(0, 60);
-                for (let i = 0; i < t.length; i++) {
-                    for (let j = i + 1; j <= Math.min(t.length, i + SEARCH_KEY_LEN); j++) keys.add(t.slice(i, j));
+            [rec.playerName, rec.kana, rec.society, rec.tournamentName].forEach(field => {
+                const chars = Array.from(normForSearch(field)).slice(0, 60);
+                for (let i = 0; i < chars.length; i++) {
+                    for (let j = i + 1; j <= Math.min(chars.length, i + SEARCH_KEY_LEN); j++) keys.add(chars.slice(i, j).join(''));
                 }
             });
             return Array.from(keys);
         }
+
+        const CLASS_LIST = ['A級', 'B級', 'C級', 'D級', 'E級'];
+        const isSearchableName = (name) => {
+            const t = String(name || '').trim();
+            return t !== '' && t !== '対戦相手不明' && !/^[（(].*[）)]$/.test(t);
+        };
+
+        // ===== 成績の集計 =====
+        const winLossCounts = (rec) => {
+            let w = 0, l = 0;
+            (rec.matches || []).forEach(m => { if (m.winLoss === 'win') w++; else if (m.winLoss === 'loss') l++; });
+            return { w, l };
+        };
+        // 「優勝」「準優勝」「3位」などから順位を数字にする
+        function rankPlace(rank) {
+            const t = String(rank || '').normalize('NFKC');
+            if (/準優勝/.test(t)) return 2;
+            if (/優勝/.test(t)) return 1;
+            const m = t.match(/^(\d+)\s*位$/);
+            return m ? parseInt(m[1], 10) : null;
+        }
+        function summarizePlayer(records) {
+            let wins = 0, losses = 0, titles = 0, runnerUps = 0, thirds = 0;
+            const byClass = {};
+            const societies = new Set();
+            records.forEach(r => {
+                const c = winLossCounts(r);
+                wins += c.w; losses += c.l;
+                const cls = r.playerClass || '不明';
+                byClass[cls] = (byClass[cls] || 0) + 1;
+                if (r.society) societies.add(r.society);
+                const p = rankPlace(r.rank);
+                if (p === 1) titles++; else if (p === 2) runnerUps++; else if (p === 3) thirds++;
+            });
+            const total = wins + losses;
+            return { entries: records.length, wins, losses, rate: total ? wins / total : null, titles, runnerUps, thirds, byClass, societies: Array.from(societies) };
+        }
+        // 検索結果に含まれる「選手」の一覧（名前をそろえてまとめる）
+        function listPlayers(records) {
+            const map = new Map();
+            records.forEach(r => {
+                const k = normForSearch(r.playerName);
+                if (!k) return;
+                const e = map.get(k) || { key: k, name: r.playerName, societies: new Set(), count: 0 };
+                e.count++;
+                if (r.society) e.societies.add(r.society);
+                map.set(k, e);
+            });
+            return Array.from(map.values()).sort((a, b) => b.count - a.count);
+        }
+        // 特定の相手との通算対戦成績
+        function headToHead(records, oppName) {
+            const ok = normForSearch(oppName);
+            let wins = 0, losses = 0;
+            records.forEach(r => (r.matches || []).forEach(m => {
+                if (normForSearch(m.opponent) !== ok) return;
+                if (m.winLoss === 'win') wins++; else if (m.winLoss === 'loss') losses++;
+            }));
+            return { wins, losses, total: wins + losses };
+        }
+
+        // ===== 絞り込み（年・大会・成績） =====
+        function applyResultFilters(records, f) {
+            return records.filter(r => {
+                if (f.cls && f.cls !== 'all' && r.playerClass !== f.cls) return false;
+                if (f.year && String(Math.floor(getEventKey(r) / 100)) !== String(f.year)) return false;
+                if (f.tournament && r.tournamentName !== f.tournament) return false;
+                if (f.perf) {
+                    const c = winLossCounts(r);
+                    const p = rankPlace(r.rank);
+                    if (f.perf === 'champion' && p !== 1) return false;
+                    if (f.perf === 'podium' && !(p !== null && p <= 3)) return false;
+                    if (f.perf === 'unbeaten' && !(c.l === 0 && c.w > 0)) return false;
+                    if (f.perf === 'winning' && !(c.w > c.l)) return false;
+                }
+                return true;
+            });
+        }
+
+        // ===== 検索条件 ⇔ URLの「#」以降 =====
+        function encodeSearchHash(s) {
+            const p = new URLSearchParams();
+            if (s.q) p.set('q', String(s.q).slice(0, 100));
+            if (s.cls && s.cls !== 'all') p.set('c', s.cls);
+            if (s.year) p.set('y', s.year);
+            if (s.tournament) p.set('t', String(s.tournament).slice(0, 100));
+            if (s.perf) p.set('p', s.perf);
+            if (s.sort === 'asc') p.set('s', 'asc');
+            if (s.group) p.set('g', '1');
+            const str = p.toString();
+            return str ? '#' + str : '';
+        }
+        function decodeSearchHash(hash) {
+            const p = new URLSearchParams(String(hash || '').replace(/^#/, ''));
+            const cls = p.get('c'), perf = p.get('p'), year = p.get('y') || '';
+            return {
+                q: (p.get('q') || '').slice(0, 100),
+                cls: CLASS_LIST.includes(cls) ? cls : 'all',
+                year: /^\d{4}$/.test(year) ? year : '',
+                tournament: (p.get('t') || '').slice(0, 100),
+                perf: ['champion', 'podium', 'unbeaten', 'winning'].includes(perf) ? perf : '',
+                sort: p.get('s') === 'asc' ? 'asc' : 'desc',
+                group: p.get('g') === '1'
+            };
+        }
+
+        // ===== 取り込み前のチェック：対戦記録の整合性 =====
+        function editDistanceAtMost1(a, b) {
+            if (a === b) return true;
+            const la = a.length, lb = b.length;
+            if (Math.abs(la - lb) > 1) return false;
+            let i = 0, j = 0, diff = 0;
+            while (i < la && j < lb) {
+                if (a[i] === b[j]) { i++; j++; continue; }
+                if (++diff > 1) return false;
+                if (la > lb) i++; else if (lb > la) j++; else { i++; j++; }
+            }
+            return diff + (la - i) + (lb - j) <= 1;
+        }
+        const INTEGRITY_LABELS = {
+            unknown: '名簿にない相手（つづり違いの疑い）',
+            mismatch: '相手の記録が食い違い',
+            conflict: '勝敗の矛盾（両者とも勝ち／負け）',
+            margin: '枚数差の不一致',
+            missing: '相手側に記録がない',
+            self: '相手が自分自身',
+            nores: '勝敗が空欄'
+        };
+        function checkIntegrity(records) {
+            const issues = [];
+            const seen = new Set();
+            const add = (type, msg, key) => {
+                if (key) { if (seen.has(key)) return; seen.add(key); }
+                issues.push({ type, msg });
+            };
+            const nk = normForSearch;
+            const bySheet = new Map(), all = new Map();
+            const push = (map, k, r) => { let a = map.get(k); if (!a) map.set(k, a = []); a.push(r); };
+            records.forEach(r => {
+                const k = nk(r.playerName);
+                if (!k) return;
+                let m = bySheet.get(r.sheetName);
+                if (!m) bySheet.set(r.sheetName, m = new Map());
+                push(m, k, r);
+                push(all, k, r);
+            });
+            const rosterNames = Array.from(all.keys());
+            const nearCache = new Map();
+            const nearOf = (ok) => {
+                if (nearCache.has(ok)) return nearCache.get(ok);
+                const near = ok.length >= 3 ? rosterNames.filter(n => n.length >= 3 && editDistanceAtMost1(ok, n)) : [];
+                nearCache.set(ok, near);
+                return near;
+            };
+            const label = (r) => `${r.playerName}（${r.playerClass}）`;
+
+            records.forEach(r => {
+                const me = nk(r.playerName);
+                (r.matches || []).forEach(m => {
+                    if (!isSearchableName(m.opponent)) return;
+                    const ok = nk(m.opponent);
+                    if (ok === me) { add('self', `${label(r)} の${m.round}：相手が自分自身になっています`, `self|${me}|${m.round}`); return; }
+                    const peers = (bySheet.get(r.sheetName) || new Map()).get(ok) || all.get(ok);
+                    if (!peers) {
+                        const near = nearOf(ok);
+                        const hint = near.length ? `（似た名前: ${near.slice(0, 3).map(n => all.get(n)[0].playerName).join('、')}）` : '';
+                        add('unknown', `${label(r)} の${m.round}：相手「${m.opponent}」が参加者名簿にありません${hint}`, `unk|${r.sheetName}|${me}|${m.round}`);
+                        return;
+                    }
+                    if (peers.length !== 1) return;   // 同姓同名がいる場合は判定しない
+                    const peer = peers[0];
+                    const pm = (peer.matches || []).find(x => x.round === m.round);
+                    const pairKey = [me, ok].sort().join('|') + '|' + m.round;
+                    if (!pm) { add('missing', `${label(r)} の${m.round}：相手「${m.opponent}」側に、この回戦の記録がありません`, `miss|${pairKey}|${me}`); return; }
+                    if (nk(pm.opponent) !== me) {
+                        add('mismatch', `${label(r)} の${m.round}：相手は「${m.opponent}」ですが、相手側の記録では対戦相手が「${pm.opponent || '空欄'}」です`, `mm|${pairKey}|${me}`);
+                        return;
+                    }
+                    if (m.winLoss && pm.winLoss && m.winLoss === pm.winLoss) {
+                        add('conflict', `${r.playerName} 対 ${m.opponent} の${m.round}：両者とも${m.winLoss === 'win' ? '勝ち' : '負け'}になっています`, `cf|${pairKey}`);
+                        return;
+                    }
+                    if (m.margin && pm.margin && String(m.margin) !== String(pm.margin)) {
+                        add('margin', `${r.playerName} 対 ${m.opponent} の${m.round}：枚数差が一致しません（${m.margin}枚 / ${pm.margin}枚）`, `mg|${pairKey}`);
+                    }
+                });
+                const n = (r.matches || []).filter(m => isSearchableName(m.opponent) && !m.winLoss).length;
+                if (n > 0) add('nores', `${label(r)}：勝敗が空欄の試合が${n}件あります`, `nr|${r._docId || r.playerName + r.sheetName}`);
+            });
+            const counts = {};
+            issues.forEach(i => { counts[i.type] = (counts[i.type] || 0) + 1; });
+            return { issues, counts };
+        }
+        // ===== END PURE =====
         const fileRegId = (key) => 'file__' + String(key).replace(/[\/\\\s.#\[\]?]+/g, '_');
 
         // ===== 書き込み・削除を「サイズを見積もって分割」して実行する =====
@@ -795,6 +1085,7 @@
                 document.getElementById('statusDot').className = "relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500";
             }
 
+            appReady = true;
             checkAccessState();
         }
 
@@ -806,6 +1097,7 @@
             } else {
                 lockModal.classList.remove('hidden');
             }
+            maybeRestoreFromUrl();   // リンクで開かれた検索は、合言葉の入力後に実行する
         }
 
         function unlockAppAccess(code) {
@@ -919,6 +1211,147 @@
             for (let m = 1; m <= 12; m++) importMonthSel.insertAdjacentHTML('beforeend', `<option value="${m}">${m}</option>`);
         })();
 
+        // ===== 小さな部品 =====
+        function el(tag, cls, text) {
+            const e = document.createElement(tag);
+            if (cls) e.className = cls;
+            if (text !== undefined) e.textContent = text;
+            return e;
+        }
+        const esc = (v) => String(v === undefined || v === null ? '' : v)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+        // 確認画面で直した大会名・開催年月を、記録に反映する
+        function applyPreviewEdits(item) {
+            const e = item.edit || {};
+            item.records.forEach(r => {
+                let changed = false;
+                if (e.name && e.name !== r.tournamentName) { r.tournamentName = e.name; changed = true; }
+                if (e.y || e.m) {
+                    const y = e.y || r.eventYear;
+                    const m = e.m ? e.m : (e.y && e.y !== r.eventYear ? 0 : r.eventMonth);
+                    r.eventYear = y; r.eventMonth = m; r.eventKey = y * 100 + m;
+                    r.date = m ? `${y}年${m}月` : `${y}年`;
+                }
+                if (changed) r.searchKeys = buildSearchKeys(r);   // 大会名が変わったら検索用キーも作り直す
+            });
+        }
+
+        function summarizeDates(records) {
+            const m = new Map();
+            records.forEach(r => {
+                const k = r.date || '不明';
+                if (!m.has(k)) m.set(k, new Set());
+                m.get(k).add(String(r.playerClass || '').replace('級', ''));
+            });
+            return Array.from(m.entries()).map(([d, cls]) => `${d}（${Array.from(cls).sort().join('・')}級）`).join('、');
+        }
+
+        // 取り込み前の確認画面。「保存」で true、「キャンセル」で false を返す
+        function showImportPreview(staged) {
+            return new Promise((resolve) => {
+                const modal = document.getElementById('importPreviewModal');
+                const body = document.getElementById('importPreviewBody');
+                const okBtn = document.getElementById('importPreviewOk');
+                const cancelBtn = document.getElementById('importPreviewCancel');
+                body.innerHTML = '';
+                const thisYear = new Date().getFullYear();
+
+                const updateOk = () => {
+                    const n = staged.filter(i => i.include).reduce((a, i) => a + i.records.length, 0);
+                    okBtn.textContent = `この内容で保存（${n}件）`;
+                    okBtn.disabled = n === 0;
+                };
+
+                staged.forEach(item => {
+                    item.include = true;
+                    item.edit = { name: item.tournamentName, y: 0, m: 0 };
+                    const card = el('div', 'border border-amber-300 rounded-lg p-3 bg-amber-50/40');
+
+                    // ファイル名・取り込む／取り込まない
+                    const head = el('label', 'flex items-start gap-2 cursor-pointer');
+                    const cb = el('input'); cb.type = 'checkbox'; cb.checked = true; cb.className = 'mt-1';
+                    cb.addEventListener('change', () => { item.include = cb.checked; card.style.opacity = cb.checked ? '1' : '0.5'; updateOk(); });
+                    const title = el('div', 'min-w-0');
+                    title.appendChild(el('div', 'font-bold text-sm text-stone-800 break-all', item.fileName));
+                    title.appendChild(el('div', 'text-[11px] text-stone-500', `${item.records.length}件の選手記録を読み取りました（チェックを外すと、このファイルは保存しません）`));
+                    head.appendChild(cb); head.appendChild(title);
+                    card.appendChild(head);
+
+                    // 大会名
+                    const nameRow = el('div', 'mt-2');
+                    nameRow.appendChild(el('div', 'text-[11px] font-bold text-stone-600 mb-0.5', '大会名'));
+                    const nameInput = el('input', 'w-full rounded-md border border-stone-300 p-1.5 text-sm bg-white');
+                    nameInput.type = 'text'; nameInput.value = item.tournamentName;
+                    nameInput.addEventListener('input', () => { item.edit.name = nameInput.value.trim() || item.tournamentName; });
+                    nameRow.appendChild(nameInput);
+                    card.appendChild(nameRow);
+
+                    // 開催年月
+                    const dateRow = el('div', 'mt-2');
+                    dateRow.appendChild(el('div', 'text-[11px] font-bold text-stone-600 mb-0.5', '開催年月'));
+                    const dsel = el('div', 'flex items-center gap-1.5 flex-wrap');
+                    const ySel = el('select', 'rounded-md border border-stone-300 p-1 text-xs bg-white');
+                    ySel.appendChild(new Option('自動（ファイルから判定）', ''));
+                    for (let y = thisYear + 1; y >= 2000; y--) ySel.appendChild(new Option(`${y}年`, String(y)));
+                    const mSel = el('select', 'rounded-md border border-stone-300 p-1 text-xs bg-white');
+                    mSel.appendChild(new Option('自動', ''));
+                    for (let m = 1; m <= 12; m++) mSel.appendChild(new Option(`${m}月`, String(m)));
+                    ySel.addEventListener('change', () => { item.edit.y = parseInt(ySel.value, 10) || 0; });
+                    mSel.addEventListener('change', () => { item.edit.m = parseInt(mSel.value, 10) || 0; });
+                    dsel.appendChild(ySel); dsel.appendChild(mSel);
+                    dateRow.appendChild(dsel);
+                    dateRow.appendChild(el('div', 'text-[11px] text-stone-500 mt-1', `自動判定: ${summarizeDates(item.records)}`));
+                    card.appendChild(dateRow);
+
+                    // シートごとの内容
+                    const table = el('table', 'w-full text-[11px] mt-2.5 border-collapse');
+                    const thead = el('tr', 'bg-amber-100/70 text-stone-700');
+                    ['シート', '級', '件数', '回戦数', '先頭の選手'].forEach(t => thead.appendChild(el('th', 'text-left p-1 font-bold', t)));
+                    table.appendChild(thead);
+                    item.sheetInfo.forEach(si => {
+                        const tr = el('tr', 'border-t border-amber-200');
+                        [si.sheetName, si.classes.join('・'), String(si.count), si.rounds + '回戦', si.sample.join('、')].forEach(t => tr.appendChild(el('td', 'p-1 align-top break-all', t)));
+                        table.appendChild(tr);
+                    });
+                    const wrap = el('div', 'overflow-x-auto'); wrap.appendChild(table);
+                    card.appendChild(wrap);
+                    if (item.sheetInfo.skipped && item.sheetInfo.skipped.length) {
+                        card.appendChild(el('div', 'text-[11px] text-stone-500 mt-1', `読み込まなかったシート: ${item.sheetInfo.skipped.join('、')}`));
+                    }
+
+                    // 読み取り時の注意
+                    if (item.notes.length) {
+                        card.appendChild(el('div', 'mt-2 text-[11px] text-amber-800 bg-amber-100/60 rounded p-1.5', '⚠️ ' + item.notes.join(' / ')));
+                    }
+
+                    // 整合性チェック
+                    const ig = item.integrity;
+                    if (ig.issues.length === 0) {
+                        card.appendChild(el('div', 'mt-2 text-[11px] text-emerald-800 bg-emerald-50 rounded p-1.5', '✅ 整合性チェック: 問題は見つかりませんでした（勝敗・相手の名前・枚数差を、相手側の記録と突き合わせました）'));
+                    } else {
+                        const det = el('details', 'mt-2 text-[11px] bg-red-50 border border-red-200 rounded p-1.5');
+                        const summ = el('summary', 'cursor-pointer font-bold text-red-800',
+                            `⚠️ 整合性チェック: ${ig.issues.length}件の指摘（` + Object.keys(ig.counts).map(k => `${INTEGRITY_LABELS[k] || k} ${ig.counts[k]}`).join('／') + '）');
+                        det.appendChild(summ);
+                        const ul = el('ul', 'list-disc pl-4 mt-1 space-y-0.5 text-stone-700');
+                        ig.issues.slice(0, 40).forEach(i => ul.appendChild(el('li', '', i.msg)));
+                        det.appendChild(ul);
+                        if (ig.issues.length > 40) det.appendChild(el('div', 'mt-1 text-stone-500', `…ほか ${ig.issues.length - 40}件`));
+                        det.appendChild(el('div', 'mt-1 text-stone-500', '指摘があっても保存はできます。Excelの入力ミスが疑われる場合は、ファイルを直してから取り込み直してください。'));
+                        card.appendChild(det);
+                    }
+                    body.appendChild(card);
+                });
+
+                updateOk();
+                modal.classList.remove('hidden');
+                const finish = (ok) => { modal.classList.add('hidden'); okBtn.onclick = null; cancelBtn.onclick = null; resolve(ok); };
+                okBtn.onclick = () => finish(true);
+                cancelBtn.onclick = () => finish(false);
+            });
+        }
+
         const excelFileInput = document.getElementById('excelFileInput');
         const importStatus = document.getElementById('importStatus');
 
@@ -1004,6 +1437,7 @@ excelFileInput.addEventListener('change', async function(e) {
             const isNoHeader = (t) => /^(no\.?|№|番号)$/i.test(t);
             const isNameHeader = (t) => /^(選手名|氏名|名前|選手|プレイヤー名?|参加者名?)([(（].*[)）])?$/.test(t);
             const isSocHeader = (t) => /^(所属.{0,6}|会名|団体名?|かるた会名?|支部名?|クラブ名?|チーム名?)$/.test(t);
+            const isKanaHeader = (t) => /^(選手名|氏名|名前)?(ふりがな|フリガナ|よみがな|ヨミガナ|よみ|ヨミ|読み)$/.test(t);
             const isRankHeader = (t) => /^(順位|最終順位|成績)$/.test(t);
             const isClassHeader = (t) => /^(級|級別)$/.test(t);
             const isClass2Header = (t) => /^クラス$/.test(t);
@@ -1051,7 +1485,7 @@ excelFileInput.addEventListener('change', async function(e) {
                 const layout = {
                     found: headerEnd >= 0, headerEnd,
                     noCol: null, nameCol: null, socCol: null, rankCol: null, classCol: null, classCol2: null,
-                    nameFromHeader: false, rounds: [], notes
+                    nameFromHeader: false, kanaCol: null, rounds: [], notes
                 };
 
                 if (!layout.found) {
@@ -1115,7 +1549,8 @@ excelFileInput.addEventListener('change', async function(e) {
                 for (let c = 0; c < width; c++) {
                     if (colInfo[c]) continue;
                     for (const t of headerCells(c).map(normHead)) {
-                        if (layout.noCol === null && isNoHeader(t)) layout.noCol = c;
+                        if (layout.kanaCol === null && isKanaHeader(t)) layout.kanaCol = c;
+                        else if (layout.noCol === null && isNoHeader(t)) layout.noCol = c;
                         else if (layout.nameCol === null && isNameHeader(t)) { layout.nameCol = c; layout.nameFromHeader = true; }
                         else if (layout.socCol === null && isSocHeader(t)) layout.socCol = c;
                         else if (layout.rankCol === null && isRankHeader(t)) layout.rankCol = c;
@@ -1253,7 +1688,7 @@ excelFileInput.addEventListener('change', async function(e) {
             }
 
             // 1ファイル分を解析して、保存用レコード配列を返す（保存はしない）
-            function parseWorkbook(workbook, fileName, fileNotes, dateOverride) {
+            function parseWorkbook(workbook, fileName, fileNotes, dateOverride, sheetInfo) {
                 const records = [];
                 const baseName = fileName.replace(/\.[^/.]+$/, "");
                 const tournamentName = detectTournamentTitle(workbook) || cleanFileName(baseName);
@@ -1349,6 +1784,7 @@ excelFileInput.addEventListener('change', async function(e) {
                         const playerName = get(layout.nameCol);
                         if (!playerName || isNameHeader(normHead(playerName))) continue;
                         const society = get(layout.socCol);
+                        const kana = get(layout.kanaCol);
                         const rank = get(layout.rankCol);
 
                         // 級：行ごとの「級」「クラス」列 → シート全体の級
@@ -1371,6 +1807,7 @@ excelFileInput.addEventListener('change', async function(e) {
                             matches: []
                         };
                         if (rank) record.rank = rank;
+                        if (kana) record.kana = kana;
 
                         let winCount = 0;
                         let lossCount = 0;
@@ -1433,6 +1870,21 @@ excelFileInput.addEventListener('change', async function(e) {
                         records.push(record);
                     }
                 }
+                // 取り込み前の確認画面に出す、シートごとの情報
+                if (sheetInfo) {
+                    targets.forEach(t => {
+                        const rs = records.filter(r => r.sheetName === t.sheetName);
+                        sheetInfo.push({
+                            sheetName: t.sheetName,
+                            classes: Array.from(new Set(rs.map(r => r.playerClass))),
+                            count: rs.length,
+                            rounds: t.layout.rounds.length,
+                            sample: rs.slice(0, 3).map(r => r.playerName),
+                            hasKana: t.layout.kanaCol !== null
+                        });
+                    });
+                    sheetInfo.skipped = workbook.SheetNames.filter(n => !targets.some(t => t.sheetName === n));
+                }
                 return records;
             }
 
@@ -1441,21 +1893,59 @@ excelFileInput.addEventListener('change', async function(e) {
             const allNotes = [];
             const usedDates = new Set();
 
+            const explainError = (error) => {
+                let reason = error && error.message ? error.message : String(error);
+                if (error && error.code === 'permission-denied') {
+                    reason = "Firestoreへの書き込み権限がありません（Firestoreのセキュリティルールを確認してください）";
+                } else if (error && error.code) {
+                    reason = `${error.code}: ${reason}`;
+                }
+                return reason;
+            };
+
+            // ① すべてのファイルを解析する（まだ保存しない）
+            const staged = [];
             for (const file of files) {
                 const fileNotes = [];
+                const sheetInfo = [];
                 try {
+                    setStatus(`${file.name} を解析しています...`, 'progress');
                     const data = await readFile(file);
                     const workbook = XLSX.read(data, { type: 'array', cellDates: true });
                     const records = parseWorkbook(workbook, file.name, fileNotes, {
                         y: parseInt(importYearSel.value, 10) || 0,
                         m: parseInt(importMonthSel.value, 10) || 0
-                    });
-                    records.forEach(r => usedDates.add(r.date));
-                    fileNotes.forEach(n => allNotes.push(`${file.name} ${n}`));
-
+                    }, sheetInfo);
                     if (records.length === 0) {
                         throw new Error("選手データ（A列がNo.の行）が見つかりませんでした。シート名: " + workbook.SheetNames.join(", "));
                     }
+                    staged.push({ file, fileName: file.name, records, notes: fileNotes, sheetInfo, integrity: checkIntegrity(records), tournamentName: records[0].tournamentName });
+                } catch (error) {
+                    console.error("Parse error:", file.name, error);
+                    failures.push(`${file.name}：${explainError(error)}`);
+                }
+            }
+            excelFileInput.value = '';
+
+            // ② 内容を確認してもらう
+            let toSave = [];
+            if (staged.length > 0) {
+                setStatus("取り込み内容を確認してください（確認画面が開いています）", 'progress');
+                const approved = await showImportPreview(staged);
+                if (!approved) {
+                    setStatus("取り込みをキャンセルしました。" + (failures.length ? ` 読み込めなかったファイル → ${failures.join(' / ')}` : ''), 'progress');
+                    return;
+                }
+                toSave = staged.filter(i => i.include);
+            }
+
+            // ③ 保存する
+            for (const item of toSave) {
+                const { file, records } = item;
+                try {
+                    applyPreviewEdits(item);
+                    records.forEach(r => usedDates.add(r.date));
+                    item.notes.forEach(n => allNotes.push(`${file.name} ${n}`));
 
                     if (isCloudConnected && auth.currentUser) {
                         if (!fileIndexReady) await refreshFileList();   // 一覧ドキュメントを先に用意しておく
@@ -1489,13 +1979,7 @@ excelFileInput.addEventListener('change', async function(e) {
                     totalAdded += records.length;
                 } catch (error) {
                     console.error("Import error:", file.name, error);
-                    let reason = error && error.message ? error.message : String(error);
-                    if (error && error.code === 'permission-denied') {
-                        reason = "Firestoreへの書き込み権限がありません（Firestoreのセキュリティルールを確認してください）";
-                    } else if (error && error.code) {
-                        reason = `${error.code}: ${reason}`;
-                    }
-                    failures.push(`${file.name}：${reason}`);
+                    failures.push(`${file.name}：${explainError(error)}`);
                 }
             }
 
@@ -1552,28 +2036,43 @@ excelFileInput.addEventListener('change', async function(e) {
         const loadMoreWrap = document.getElementById('loadMoreWrap');
         const loadMoreBtn = document.getElementById('loadMoreBtn');
 
-        function matchesSearch(record, q, filterValue) {
-            const matchQuery =
-                normForSearch(record.playerName).includes(q) ||
+        // 検索で読み込んだ記録をためておく（対戦成績の集計に使う）
+        const recordStore = new Map();
+
+        // 絞り込み・まとめ表示の部品
+        const yearFilter = document.getElementById('yearFilter');
+        const tournamentFilter = document.getElementById('tournamentFilter');
+        const perfFilter = document.getElementById('perfFilter');
+        const groupToggle = document.getElementById('groupToggle');
+        const extraFilterRow = document.getElementById('extraFilterRow');
+        const playerSummaryEl = document.getElementById('playerSummary');
+        const copyLinkBtn = document.getElementById('copyLinkBtn');
+        let pendingFilters = null;   // 検索結果が出たら当てはめる「年」「大会」の指定（URL・戻る操作用）
+
+        const currentFilters = () => ({ cls: classFilter.value, year: yearFilter.value, tournament: tournamentFilter.value, perf: perfFilter.value });
+
+        function matchesSearch(record, q) {
+            return normForSearch(record.playerName).includes(q) ||
+                normForSearch(record.kana).includes(q) ||
                 normForSearch(record.society).includes(q) ||
                 normForSearch(record.tournamentName).includes(q);
-            const matchClass = filterValue === 'all' || record.playerClass === filterValue;
-            return matchQuery && matchClass;
         }
 
         async function performSearch() {
             const rawQuery = searchInput.value.trim();
-            lastSearchQuery = rawQuery;
             const q = normForSearch(rawQuery);
-            const filterValue = classFilter.value;
-
             if (!q) return;
+            lastSearchQuery = rawQuery;
+            if (!pendingFilters) { yearFilter.value = ''; tournamentFilter.value = ''; }   // 年・大会は、検索結果ごとに選び直す
 
-            searchState = { q, rawQuery, filterValue, cursor: null, hasMore: false, results: [] };
+            searchState = { q, rawQuery, grams: pickGramVariants(q), cursor: null, hasMore: false, results: [] };
             initialMessage.classList.add('hidden');
             resultsContainer.innerHTML = '';
             emptyMessage.classList.add('hidden');
             loadMoreWrap.classList.add('hidden');
+            playerSummaryEl.classList.add('hidden');
+            extraFilterRow.classList.add('hidden');
+            copyLinkBtn.classList.add('hidden');
             resultsHeader.querySelector('span').textContent = `「${rawQuery}」の検索結果`;
             await loadSearchPage();
         }
@@ -1591,7 +2090,11 @@ excelFileInput.addEventListener('change', async function(e) {
             let candidates = [];
             try {
                 if (isCloudConnected) {
-                    const conds = [where('searchKeys', 'array-contains', st.q.slice(0, SEARCH_KEY_LEN))];
+                    // 異体字・ひらがな/カタカナの候補をまとめて探す（古いデータにも当たる）
+                    const keyCond = st.grams.length > 1
+                        ? where('searchKeys', 'array-contains-any', st.grams)
+                        : where('searchKeys', 'array-contains', st.grams[0]);
+                    const conds = [keyCond];
                     if (st.cursor) conds.push(startAfter(st.cursor));
                     conds.push(limit(SEARCH_PAGE_SIZE));
                     const snap = await getDocs(fsQuery(recordsColRef, ...conds));
@@ -1611,6 +2114,7 @@ excelFileInput.addEventListener('change', async function(e) {
                 loadMoreBtn.disabled = false;
                 loadMoreBtn.textContent = 'もっと見る';
                 if (isFirst) {
+                    emptyMessage.textContent = '取得に失敗しました。時間をおいて、もう一度お試しください。';
                     emptyMessage.classList.remove('hidden');
                     resultCount.textContent = "取得に失敗しました";
                 } else {
@@ -1619,8 +2123,26 @@ excelFileInput.addEventListener('change', async function(e) {
                 return;
             }
 
-            candidates.forEach(r => { if (matchesSearch(r, st.q, st.filterValue)) st.results.push(r); });
+            candidates.forEach(r => {
+                recordStore.set(r.id, r);
+                if (matchesSearch(r, st.q)) st.results.push(r);
+            });
             renderSearchState(st);
+            syncUrl();
+        }
+
+        // 年・大会の選択肢を、いまの検索結果から作り直す
+        function rebuildFilterOptions(results) {
+            const years = Array.from(new Set(results.map(r => Math.floor(getEventKey(r) / 100)).filter(y => y > 0))).sort((a, b) => b - a);
+            const tournaments = Array.from(new Set(results.map(r => r.tournamentName).filter(Boolean))).sort((a, b) => a.localeCompare(b, 'ja'));
+            const keep = pendingFilters || { year: yearFilter.value, tournament: tournamentFilter.value };
+            yearFilter.innerHTML = '<option value="">すべて</option>';
+            years.forEach(y => yearFilter.appendChild(new Option(`${y}年`, String(y))));
+            tournamentFilter.innerHTML = '<option value="">すべて</option>';
+            tournaments.forEach(t => tournamentFilter.appendChild(new Option(t, t)));
+            yearFilter.value = years.map(String).includes(String(keep.year)) ? String(keep.year) : '';
+            tournamentFilter.value = tournaments.includes(keep.tournament) ? keep.tournament : '';
+            pendingFilters = null;
         }
 
         // 保存してある検索結果を画面に表示する（読み取りは発生しない）
@@ -1633,91 +2155,293 @@ excelFileInput.addEventListener('change', async function(e) {
             loadMoreBtn.textContent = 'もっと見る';
             loadMoreWrap.classList.toggle('hidden', !st.hasMore);
 
-            const n = st.results.length;
+            rebuildFilterOptions(st.results);
+            const hasAny = st.results.length > 0;
+            extraFilterRow.classList.toggle('hidden', !hasAny);
+            copyLinkBtn.classList.toggle('hidden', !hasAny);
+
+            const filtered = applyResultFilters(st.results, currentFilters());
+            const n = filtered.length;
+            emptyMessage.textContent = hasAny ? '条件に合う記録がありません。絞り込みを変えてみてください。' : '該当する試合記録が見つかりませんでした。';
             emptyMessage.classList.toggle('hidden', n > 0 || st.hasMore);
-            resultCount.textContent = `${n}件表示` + (st.hasMore ? "（続きがあります）" : "");
-            if (n > 0) renderResults(sortResults(st.results));
+            resultCount.textContent = `${n}件表示` + (n !== st.results.length ? `（絞り込み前 ${st.results.length}件）` : '') + (st.hasMore ? "（続きがあります）" : "");
+            renderPlayerSummary(st, filtered);
+            if (n > 0) renderResults(sortResults(filtered));
             else resultsContainer.innerHTML = '';
         }
 
-        // ===== 対戦相手の名前から検索 → 「前の画面に戻る」 =====
+        // ===== 選手の成績サマリー =====
+        function renderPlayerSummary(st, filtered) {
+            playerSummaryEl.innerHTML = '';
+            // 検索語が「選手名（またはふりがな）」に当てはまる記録だけを対象にする
+            const nameHits = filtered.filter(r => normForSearch(r.playerName).includes(st.q) || normForSearch(r.kana).includes(st.q));
+            const players = listPlayers(nameHits);
+            if (players.length === 0) { playerSummaryEl.classList.add('hidden'); return; }
+            playerSummaryEl.classList.remove('hidden');
+
+            if (players.length > 1) {
+                const box = el('div', 'bg-amber-50 border border-amber-300 rounded-xl p-3');
+                box.appendChild(el('p', 'text-xs font-bold text-amber-900 mb-2', `この検索に当てはまる選手が${players.length}人います。選ぶと、その選手の成績をまとめて表示します。`));
+                const chips = el('div', 'flex flex-wrap gap-1.5');
+                players.slice(0, 8).forEach(pl => {
+                    const soc = Array.from(pl.societies)[0] || '所属なし';
+                    const b = el('button', 'text-xs bg-white hover:bg-amber-100 border border-amber-400 text-amber-900 font-bold rounded-full px-3 py-1', `${pl.name}（${soc}・${pl.count}件）`);
+                    b.type = 'button';
+                    b.addEventListener('click', () => searchByName(pl.name));
+                    chips.appendChild(b);
+                });
+                box.appendChild(chips);
+                if (players.length > 8) box.appendChild(el('p', 'text-[11px] text-stone-500 mt-1.5', `…ほか${players.length - 8}人（名前をもう少し詳しく入力すると絞り込めます）`));
+                playerSummaryEl.appendChild(box);
+                return;
+            }
+
+            const sum = summarizePlayer(nameHits);
+            const card = el('div', 'bg-white border-2 border-amber-300 rounded-xl p-4 shadow-sm');
+            const top = el('div', 'flex justify-between items-start gap-3');
+            const left = el('div', 'min-w-0');
+            left.appendChild(el('p', 'text-[11px] font-bold text-amber-800', '選手の成績'));
+            left.appendChild(el('h3', 'text-xl font-bold text-stone-900 font-karuta break-all', players[0].name));
+            left.appendChild(el('p', 'text-xs text-stone-500 mt-0.5', sum.societies.length ? sum.societies.join(' / ') : '所属記載なし'));
+            const right = el('div', 'text-right shrink-0');
+            right.appendChild(el('p', 'text-[11px] text-stone-500', '勝率'));
+            right.appendChild(el('p', 'text-2xl font-bold text-red-700 leading-none', sum.rate === null ? '—' : `${Math.round(sum.rate * 100)}%`));
+            top.appendChild(left); top.appendChild(right);
+            card.appendChild(top);
+
+            const grid = el('div', 'grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3');
+            const stat = (label, value) => {
+                const c = el('div', 'bg-amber-50/60 border border-amber-200 rounded-lg p-2');
+                c.appendChild(el('p', 'text-[10px] text-stone-500 font-bold', label));
+                c.appendChild(el('p', 'text-sm font-bold text-stone-800 mt-0.5 break-words', value));
+                grid.appendChild(c);
+            };
+            stat('通算成績', `${sum.wins}勝 ${sum.losses}敗`);
+            stat('出場', `${sum.entries}大会`);
+            const honors = [];
+            if (sum.titles) honors.push(`優勝${sum.titles}`);
+            if (sum.runnerUps) honors.push(`準優勝${sum.runnerUps}`);
+            if (sum.thirds) honors.push(`3位${sum.thirds}`);
+            stat('優勝・入賞', honors.length ? honors.join('・') : '—');
+            stat('級ごとの出場', CLASS_LIST.filter(c => sum.byClass[c]).map(c => `${c}${sum.byClass[c]}`).join(' / ') || '—');
+            card.appendChild(grid);
+
+            const f = currentFilters();
+            const notes = [];
+            if (st.hasMore) notes.push('読み込み済みの記録で集計しています（「もっと見る」で増えます）');
+            if (f.cls !== 'all' || f.year || f.tournament || f.perf) notes.push('絞り込み後の記録で集計しています');
+            if (sum.societies.length > 1) notes.push('所属が複数あります（同姓同名の別の人が含まれている可能性があります）');
+            if (notes.length) card.appendChild(el('p', 'text-[10px] text-stone-400 mt-2', '※ ' + notes.join(' ／ ')));
+            playerSummaryEl.appendChild(card);
+        }
+
+        // ===== 画面の履歴（URLの共有・ブラウザの戻る・「前の画面に戻る」） =====
         const navBackRow = document.getElementById('navBackRow');
         const navBackBtn = document.getElementById('navBackBtn');
-        let navStack = [];   // 戻るための履歴（直前の検索結果と、開いていた詳細画面）
+        const sessionId = Math.random().toString(36).slice(2);
+        let viewSeq = 0;
+        let currentVid = null;
+        const viewStore = new Map();     // 画面ごとの保存データ（読み取りなしで戻れるように）
+        let currentModalRecord = null;   // 開いている対戦詳細の記録
 
-        const isSearchableName = (name) => {
-            const t = String(name || '').trim();
-            return t !== '' && t !== '対戦相手不明' && !/^[（(].*[）)]$/.test(t);
-        };
-        function updateNavBack() {
-            navBackRow.classList.toggle('hidden', navStack.length === 0);
+        const hasAccess = () => isPasscodeVerified || !!(auth.currentUser && auth.currentUser.email === ADMIN_EMAIL);
+        const urlStateNow = () => ({
+            q: searchState ? searchState.rawQuery : '',
+            cls: classFilter.value, year: yearFilter.value, tournament: tournamentFilter.value, perf: perfFilter.value,
+            sort: sortOrder.value, group: groupToggle.checked
+        });
+        const urlFor = (hash) => location.pathname + location.search + hash;
+        // いまの検索条件を、URLの「#」以降に反映する（共有用リンクになる）
+        function syncUrl() {
+            if (!searchState) return;
+            try { history.replaceState(history.state, '', urlFor(encodeSearchHash(urlStateNow()))); } catch (e) { /* 履歴を使えない環境では何もしない */ }
         }
-        function resetNav() {
-            navStack = [];
-            updateNavBack();
+        function updateBackBtn() {
+            const st = history.state;
+            navBackRow.classList.toggle('hidden', !(st && st.via === 'opponent' && st.idx > 0));
         }
-        function searchOpponent(name, fromRecord) {
-            // 今の画面（検索結果＋開いていた詳細）を保存してから、相手の名前で検索する
-            navStack.push({
-                rawQuery: searchInput.value,
-                filter: classFilter.value,
-                state: searchState,
-                record: fromRecord,
-                scrollY: window.scrollY
+        // 離れる画面の状態を保存する
+        function snapshotCurrentView() {
+            if (!currentVid) return;
+            const v = viewStore.get(currentVid) || {};
+            Object.assign(v, {
+                state: searchState, q: searchState ? searchState.rawQuery : searchInput.value,   // 入力欄ではなく、実際に検索した語を保存する
+                filters: { ...currentFilters(), sort: sortOrder.value, group: groupToggle.checked },
+                scrollY: window.scrollY, modalRecord: currentModalRecord, captured: true
             });
-            updateNavBack();
-            closeModal();
+            viewStore.set(currentVid, v);
+        }
+        // 新しい画面へ進む（ブラウザの履歴に1つ追加する）
+        function pushView(via, target) {
+            snapshotCurrentView();
+            const prevIdx = (history.state && history.state.idx) || 0;
+            currentVid = `${sessionId}:${++viewSeq}`;
+            viewStore.set(currentVid, { via });
+            try { history.pushState({ vid: currentVid, idx: prevIdx + 1, via }, '', urlFor(encodeSearchHash(target))); } catch (e) { /* 履歴を使えない環境では何もしない */ }
+            updateBackBtn();
+        }
+        function clearResultsUI() {
+            searchState = null;
+            lastFiltered = null;
+            resultsContainer.innerHTML = '';
+            loadingIndicator.classList.add('hidden');
+            loadMoreWrap.classList.add('hidden');
+            emptyMessage.classList.add('hidden');
+            resultCount.textContent = '';
+            playerSummaryEl.classList.add('hidden');
+            extraFilterRow.classList.add('hidden');
+            copyLinkBtn.classList.add('hidden');
+            resultsHeader.querySelector('span').textContent = '検索結果';
+            initialMessage.classList.remove('hidden');
+        }
+        // 保存してある画面を、そのまま表示する（読み取りなし）
+        function restoreView(v) {
+            searchInput.value = v.q || '';
+            const f = v.filters || {};
+            classFilter.value = f.cls || 'all';
+            perfFilter.value = f.perf || '';
+            sortOrder.value = f.sort || 'desc';
+            groupToggle.checked = !!f.group;
+            pendingFilters = { year: f.year || '', tournament: f.tournament || '' };
+            searchState = v.state || null;
+            if (searchState) renderSearchState(searchState); else clearResultsUI();
+            pendingFilters = null;
+            if (v.modalRecord) openModal(v.modalRecord);
+            requestAnimationFrame(() => window.scrollTo(0, v.scrollY || 0));
+        }
+        // URLの「#」以降から検索をやり直す（リンクを開いたとき・ページを再読み込みしたとき）
+        function restoreFromHash() {
+            const s = decodeSearchHash(location.hash);
+            classFilter.value = s.cls;
+            perfFilter.value = s.perf;
+            sortOrder.value = s.sort;
+            groupToggle.checked = s.group;
+            if (!s.q) { searchInput.value = ''; clearResultsUI(); return; }
+            searchInput.value = s.q;
+            pendingFilters = { year: s.year, tournament: s.tournament };
+            performSearch();
+        }
+        // 合言葉の入力前に開かれたリンクは、入力が済んでから実行する
+        function maybeRestoreFromUrl() {
+            if (!pendingUrlRestore || !appReady || !hasAccess()) return;
+            pendingUrlRestore = false;
+            restoreFromHash();
+        }
+
+        // 手入力した検索
+        function submitSearch() {
+            const q = searchInput.value.trim();
+            if (!q) return;
+            if (searchState && searchState.rawQuery === q) { performSearch(); return; }   // 同じ語は、やり直すだけ
+            pushView('manual', { q, cls: classFilter.value, perf: perfFilter.value, sort: sortOrder.value, group: groupToggle.checked });
+            pendingFilters = { year: '', tournament: '' };
+            performSearch();
+        }
+        function runSearchFor(name, cls) {
             searchInput.value = name;
-            classFilter.value = 'all';   // 相手の級が違っても見つかるようにする
+            classFilter.value = cls;
+            perfFilter.value = '';
+            pendingFilters = { year: '', tournament: '' };
             window.scrollTo(0, 0);
             performSearch();
         }
-        function goBackNav() {
-            const e = navStack.pop();
-            if (!e) return;
-            updateNavBack();
-            searchInput.value = e.rawQuery;
-            classFilter.value = e.filter;
-            lastSearchQuery = e.rawQuery.trim();
-            searchState = e.state;   // 進行中だった別の検索の結果は破棄される
-            if (e.state) {
-                renderSearchState(e.state);
-            } else {
-                resultsContainer.innerHTML = '';
-                loadingIndicator.classList.add('hidden');
-                loadMoreWrap.classList.add('hidden');
-                emptyMessage.classList.add('hidden');
-                resultCount.textContent = '';
-                initialMessage.classList.remove('hidden');
-            }
-            if (e.record) openModal(e.record);   // 見ていた詳細画面を開き直す
-            requestAnimationFrame(() => window.scrollTo(0, e.scrollY || 0));
+        // 対戦相手の名前から検索（戻るボタンつき）
+        function searchOpponent(name) {
+            pushView('opponent', { q: name, cls: 'all', sort: sortOrder.value, group: groupToggle.checked });
+            closeModal();
+            runSearchFor(name, 'all');   // 相手の級が違っても見つかるようにする
         }
-        navBackBtn.addEventListener('click', goBackNav);
+        // 候補の選手を選んで検索
+        function searchByName(name) {
+            pushView('manual', { q: name, cls: classFilter.value, sort: sortOrder.value, group: groupToggle.checked });
+            runSearchFor(name, classFilter.value);
+        }
+
+        // ブラウザの「戻る」「進む」
+        window.addEventListener('popstate', (ev) => {
+            snapshotCurrentView();
+            closeModal();
+            const st = ev.state || {};
+            currentVid = st.vid || null;
+            updateBackBtn();
+            if (!appReady || !hasAccess()) { pendingUrlRestore = true; return; }
+            const v = currentVid ? viewStore.get(currentVid) : null;
+            if (v && v.captured) restoreView(v); else restoreFromHash();
+        });
+        navBackBtn.addEventListener('click', () => history.back());
+
+        // 絞り込み・並び順・まとめ表示の切り替え（読み取りなし）
+        [classFilter, yearFilter, tournamentFilter, perfFilter, groupToggle, sortOrder].forEach(ctrl => {
+            ctrl.addEventListener('change', () => {
+                if (searchState) { renderSearchState(searchState); syncUrl(); }
+            });
+        });
         loadMoreBtn.addEventListener('click', () => loadSearchPage());
+
+        // 検索結果のリンクをコピー
+        copyLinkBtn.addEventListener('click', async () => {
+            syncUrl();
+            const url = location.href;
+            let ok = false;
+            try { await navigator.clipboard.writeText(url); ok = true; } catch (e) {
+                try {
+                    const ta = document.createElement('textarea');
+                    ta.value = url; ta.style.position = 'fixed'; ta.style.opacity = '0';
+                    document.body.appendChild(ta); ta.select();
+                    ok = document.execCommand('copy');
+                    ta.remove();
+                } catch (e2) { ok = false; }
+            }
+            if (!ok) { prompt('このリンクをコピーしてください', url); return; }
+            const old = copyLinkBtn.textContent;
+            copyLinkBtn.textContent = '✔ コピーしました';
+            setTimeout(() => { copyLinkBtn.textContent = old; }, 1800);
+        });
+
+        // 起動時：履歴の初期化と、リンクで開かれた検索条件の確認
+        (function initHistory() {
+            const hs = history.state || {};
+            currentVid = `${sessionId}:0`;
+            viewStore.set(currentVid, {});
+            try { history.replaceState({ vid: currentVid, idx: hs.idx || 0, via: hs.via }, '', location.href); } catch (e) { /* ignore */ }
+            updateBackBtn();
+            if (decodeSearchHash(location.hash).q) pendingUrlRestore = true;
+        })();
 
         function renderResults(results) {
             resultsContainer.innerHTML = '';
+            const grouped = groupToggle.checked;
+            const keyOf = (r) => `${r.tournamentName}|${getEventKey(r)}`;
+            const counts = new Map();
+            if (grouped) results.forEach(r => counts.set(keyOf(r), (counts.get(keyOf(r)) || 0) + 1));
+            let lastKey = null;
 
             results.forEach(record => {
+                if (grouped && keyOf(record) !== lastKey) {
+                    lastKey = keyOf(record);
+                    const hd = el('div', 'pt-3 pb-1 border-b-2 border-emerald-800/30 flex justify-between items-baseline gap-2');
+                    hd.appendChild(el('h4', 'text-sm font-bold text-emerald-950 font-karuta', record.tournamentName || '（大会名なし）'));
+                    hd.appendChild(el('span', 'text-[11px] text-stone-500 shrink-0', `${record.date || ''}　${counts.get(lastKey)}件`));
+                    resultsContainer.appendChild(hd);
+                }
                 const card = document.createElement('div');
                 card.className = 'karuta-card cursor-pointer';
-                
+
                 card.innerHTML = `
                     <div class="flex justify-between items-start mb-2">
                         <div>
-                            <span class="inline-block bg-amber-100 text-amber-900 border border-amber-300 rounded px-2.5 py-0.5 text-xs font-bold mr-2 font-karuta">${record.playerClass || '不明'}</span>
-                            <h3 class="text-lg font-bold text-stone-900 inline-block font-karuta">${record.playerName}</h3>
-                            <p class="text-xs text-stone-500 mt-0.5 font-medium">${record.society || '所属記載なし'}</p>
+                            <span class="inline-block bg-amber-100 text-amber-900 border border-amber-300 rounded px-2.5 py-0.5 text-xs font-bold mr-2 font-karuta">${esc(record.playerClass || '不明')}</span>
+                            <h3 class="text-lg font-bold text-stone-900 inline-block font-karuta">${esc(record.playerName)}</h3>
+                            <p class="text-xs text-stone-500 mt-0.5 font-medium">${esc(record.society || '所属記載なし')}</p>
                         </div>
                         <div class="text-right">
-                            <span class="text-[11px] text-stone-400 block">${record.date || ''}</span>
+                            <span class="text-[11px] text-stone-400 block">${esc(record.date || '')}</span>
                         </div>
                     </div>
                     <div class="mt-2.5 border-t border-stone-100 pt-2 flex justify-between items-end">
                         <div>
-                            <p class="text-sm font-bold text-emerald-950 font-karuta">${record.tournamentName}</p>
-                            <p class="text-xs font-medium mt-0.5">結果: <span class="text-red-700 font-bold">${record.result}</span></p>
+                            <p class="text-sm font-bold text-emerald-950 font-karuta">${esc(record.tournamentName)}</p>
+                            <p class="text-xs font-medium mt-0.5">結果: <span class="text-red-700 font-bold">${esc(record.result)}</span></p>
                         </div>
                         <p class="text-xs text-amber-800 font-bold flex items-center hover:underline">
                             対戦詳細
@@ -1742,6 +2466,14 @@ excelFileInput.addEventListener('change', async function(e) {
         const modalMatchList = document.getElementById('modalMatchList');
 
         function openModal(record) {
+            currentModalRecord = record;
+            // この選手の、読み込み済みの全記録（通算の対戦成績に使う）
+            const myKey = normForSearch(record.playerName);
+            const mineMap = new Map();
+            recordStore.forEach(r => { if (normForSearch(r.playerName) === myKey) mineMap.set(r.id, r); });
+            mineMap.set(record.id, record);
+            const mine = Array.from(mineMap.values());
+
             modalTournamentName.textContent = record.tournamentName;
             modalPlayerInfo.textContent = `${record.playerName} (${record.society || '所属なし'}) - ${record.playerClass}`;
             
@@ -1764,6 +2496,7 @@ excelFileInput.addEventListener('change', async function(e) {
                             <div>
                                 <p class="opp-name text-xs font-bold text-stone-800"></p>
                                 <p class="opp-soc text-[10px] text-stone-400"></p>
+                                <p class="opp-h2h text-[10px] text-amber-800 font-bold"></p>
                             </div>
                         </div>
                         <div class="text-xs font-bold ${isWin ? 'text-red-700' : 'text-blue-800'}">
@@ -1774,13 +2507,18 @@ excelFileInput.addEventListener('change', async function(e) {
                     const oppEl = matchEl.querySelector('.opp-name');
                     oppEl.textContent = match.opponent || '';
                     matchEl.querySelector('.opp-soc').textContent = match.opponentSociety || '';
+                    // 通算の対戦成績（2回以上対戦しているときだけ表示）
+                    if (isSearchableName(match.opponent)) {
+                        const h2h = headToHead(mine, match.opponent);
+                        if (h2h.total >= 2) matchEl.querySelector('.opp-h2h').textContent = `通算対戦成績: ${h2h.wins}勝${h2h.losses}敗`;
+                    }
                     // 名前がわかる相手は、タップでその選手を検索できるようにする
                     if (isSearchableName(match.opponent)) {
                         oppEl.classList.add('text-amber-800', 'underline', 'decoration-dotted', 'underline-offset-2', 'cursor-pointer', 'hover:text-amber-950');
                         oppEl.setAttribute('role', 'link');
                         oppEl.setAttribute('tabindex', '0');
                         oppEl.title = `「${match.opponent}」を検索`;
-                        const go = () => searchOpponent(match.opponent, record);
+                        const go = () => searchOpponent(match.opponent);
                         oppEl.addEventListener('click', (ev) => { ev.stopPropagation(); go(); });
                         oppEl.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); go(); } });
                     }
@@ -1794,6 +2532,7 @@ excelFileInput.addEventListener('change', async function(e) {
         }
 
         function closeModal() {
+            currentModalRecord = null;
             detailModal.classList.add('hidden');
         }
 
@@ -2199,15 +2938,11 @@ excelFileInput.addEventListener('change', async function(e) {
         usageRange.addEventListener('change', loadUsage);
 
         // Event Listeners Setup
-        searchButton.addEventListener('click', () => { resetNav(); performSearch(); });
-        sortOrder.addEventListener('change', () => {
-            if (lastFiltered && lastFiltered.length) renderResults(sortResults(lastFiltered));
-        });
+        searchButton.addEventListener('click', submitSearch);
         
         searchInput.addEventListener('keypress', function (e) {
             if (e.key === 'Enter') {
-                resetNav();
-                performSearch();
+                submitSearch();
             }
         });
 
